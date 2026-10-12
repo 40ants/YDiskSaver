@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Copy a private Yandex Disk folder through the web UI's models-v2 API.
 
-The browser is not started. A previously saved Playwright storage-state JSON file
+The browser is not started. A previously saved local session JSON file
 supplies cookies. Existing local files are skipped without requesting a download URL.
 If the original cannot be downloaded, image previews are saved as preview-*.jpg
 (or with another extension matching their response type). A preview does not
 count as a successful copy of the original.
 """
+
+from __future__ import annotations
 
 import argparse
 from collections import Counter
@@ -300,7 +302,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Пример: python3 yadisk_web_copy.py /disk/crons ~/tmp/disk",
+        epilog="Пример: python3 ydisk_saver.py /disk/crons ~/tmp/disk",
     )
     parser.add_argument("remote_path", help="Папка на Диске, например /disk/crons")
     parser.add_argument("local_dir", type=Path, help="Локальная папка для её содержимого")

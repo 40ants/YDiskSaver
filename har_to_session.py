@@ -50,7 +50,6 @@ def convert_har(document: dict) -> dict:
 
 def write_private_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.parent.chmod(0o700)
     temporary = None
     previous_umask = os.umask(0o077)
     try:

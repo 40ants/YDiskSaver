@@ -1,0 +1,12 @@
+# Browser credentials and network captures
+*.har
+session.json
+*.storage-state.json
+*.cookies
+.env
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store

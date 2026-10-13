@@ -104,6 +104,19 @@ def existing_preview(local: Path, name: str) -> Path | None:
     return None
 
 
+def print_missing_session(path: Path) -> None:
+    print(f"Не найден файл сессии Яндекс Диска: {path}", file=sys.stderr)
+    print("Как его создать:", file=sys.stderr)
+    print("  1. Войдите в Яндекс Диск в Chrome и откройте DevTools → Network.", file=sys.stderr)
+    print("  2. Перейдите в папку Диска и выберите «Copy all listed as HAR (with sensitive data)».", file=sys.stderr)
+    print("  3. Сохраните скопированный HAR в файл, затем выполните:", file=sys.stderr)
+    if path == DEFAULT_STATE.expanduser():
+        print('     python3 har_to_session.py "$HOME/Downloads/ydisk-session.har"', file=sys.stderr)
+    else:
+        print('     python3 har_to_session.py "$HOME/Downloads/ydisk-session.har" "' + str(path) + '"', file=sys.stderr)
+    print("Подробности: README.md, раздел «Как получить данные для входа».", file=sys.stderr)
+
+
 class DiskWeb:
     def __init__(self, state: Path, remote: str, timeout: float):
         self.remote = remote
@@ -319,8 +332,12 @@ def main() -> int:
     if (args.request_timeout <= 0 or args.file_timeout <= 0
             or args.preview_timeout <= 0 or args.retries < 1):
         parser.error("Таймауты и число попыток должны быть положительными")
+    state_path = args.state.expanduser()
+    if not state_path.is_file():
+        print_missing_session(state_path)
+        return 2
     try:
-        client = DiskWeb(args.state.expanduser(), remote, args.request_timeout)
+        client = DiskWeb(state_path, remote, args.request_timeout)
         root = prepare_root(args.local_dir)
         counts = Counter()
         copy_tree(client, remote, root, root, args.retries, args.file_timeout,

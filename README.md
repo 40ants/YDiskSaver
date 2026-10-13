@@ -33,6 +33,9 @@ python3 ydisk_saver.py --help
 1. Войдите в свой Яндекс Диск в Chrome и откройте любую папку своего Диска.
 2. Откройте **DevTools → Network** и обновите страницу или перейдите в другую папку. В списке должен появиться запрос к `disk.yandex.ru`, например `models-v2`.
 3. В списке запросов выберите **Copy all listed as HAR (with sensitive data)**. Сохраните текст из буфера обмена в UTF-8 файл, например `~/Downloads/ydisk-session.har`.
+
+   ![Пункт Copy all listed as HAR (with sensitive data) в меню DevTools](docs/images/copy-har.png)
+
 4. Локально преобразуйте HAR в файл сессии:
 
    ```bash

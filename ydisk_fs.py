@@ -1,5 +1,6 @@
 """Safe local writes for a one-way Yandex Disk copy."""
 
+import errno
 import os
 from pathlib import Path
 import stat
@@ -73,6 +74,14 @@ def save_stream(source, destination: Path, root: Path, expected_size=None, deadl
             os.link(temporary, destination)
         except FileExistsError:
             return "skipped"
+        except OSError as error:
+            if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise
+            # FAT filesystems cannot create hard links. The temporary file is
+            # already complete and lives in the destination directory.
+            if destination.exists() or destination.is_symlink():
+                return "skipped"
+            os.replace(temporary, destination)
         return "downloaded"
     finally:
         if temporary is not None:

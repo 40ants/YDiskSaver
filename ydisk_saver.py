@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
@@ -62,6 +63,17 @@ def error_label(error: BaseException) -> str:
     if isinstance(error, TimeoutError):
         return "таймаут"
     return type(error).__name__
+
+
+def print_debug_error(error: BaseException, context: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    # Download links are signed; keep them out of logs that may be shared.
+    details = re.sub(r"(?:https?:)?//[^\s'\"<>]+", "<URL скрыт>", details)
+    details = re.sub(r"(?im)\b(?:cookie|authorization)\s*[:=]\s*[^\n]+", "<данные входа скрыты>", details)
+    details = re.sub(r"(?i)\b(sk|connection_id)\s*[:=]\s*[^\s,;}]+", r"\1=<скрыто>", details)
+    print(f"[debug] {context}\n{details.rstrip()}", file=sys.stderr)
 
 
 def normalize_download_url(url: str) -> str:
@@ -118,9 +130,10 @@ def print_missing_session(path: Path) -> None:
 
 
 class DiskWeb:
-    def __init__(self, state: Path, remote: str, timeout: float):
+    def __init__(self, state: Path, remote: str, timeout: float, debug: bool = False):
         self.remote = remote
         self.timeout = timeout
+        self.debug = debug
         self.opener = build_opener(HTTPCookieProcessor(cookie_jar(state)))
         self.page = "https://disk.yandex.ru/client" + quote(remote, safe="/")
         self.headers = {
@@ -192,9 +205,10 @@ class DiskWeb:
                 try:
                     result = self.call("mpfs/resources", params)
                     break
-                except (HTTPError, URLError, TimeoutError):
+                except (HTTPError, URLError, TimeoutError) as error:
                     if attempt == 1:
                         raise
+                    print_debug_error(error, f"повтор запроса списка {directory}", self.debug)
                     time.sleep(1)
             resources = result.get("resources")
             if not isinstance(resources, list):
@@ -234,13 +248,14 @@ class DiskWeb:
 
 def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
               retries: int, file_timeout: float, preview_timeout: float,
-              counts: Counter) -> None:
+              counts: Counter, debug: bool = False) -> None:
     ensure_directory(local, root)
     try:
         children = list(client.list_children(remote))
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
         counts["errors"] += 1
         print(f"Ошибка списка {remote}: {error_label(error)}", file=sys.stderr)
+        print_debug_error(error, f"список {remote}", debug)
         return
 
     for item in children:
@@ -252,7 +267,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
             if kind == "dir":
                 counts["directories"] += 1
                 copy_tree(client, path, target, root, retries, file_timeout,
-                          preview_timeout, counts)
+                          preview_timeout, counts, debug)
                 continue
             if kind != "file":
                 raise ValueError("Неизвестный тип ресурса")
@@ -278,6 +293,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                     break
                 except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
                     original_error = error
+                    print_debug_error(error, f"оригинал {path}, попытка {attempt + 1}/{retries}", debug)
                     if attempt + 1 < retries:
                         time.sleep(1)
             else:
@@ -288,7 +304,10 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                     counts["preview_skipped"] += 1
                     print(f"Превью уже есть: {preview}")
                     continue
-                for url in preview_urls(item):
+                candidates = list(preview_urls(item))
+                if not candidates and debug:
+                    print(f"[debug] Для {path} в метаданных нет URL превью.", file=sys.stderr)
+                for preview_number, url in enumerate(candidates, 1):
                     try:
                         deadline = time.monotonic() + preview_timeout
                         with client.open_download(url) as response:
@@ -303,13 +322,15 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                         counts["previewed" if status == "downloaded" else "preview_skipped"] += 1
                         print(f"Превью: {preview}")
                         break
-                    except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError):
+                    except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
+                        print_debug_error(error, f"превью {path}, вариант {preview_number}", debug)
                         continue
                 else:
                     print(f"Превью тоже недоступно: {path}", file=sys.stderr)
         except (KeyError, ValueError, OSError) as error:
             counts["errors"] += 1
             print(f"Ошибка элемента в {remote}: {error_label(error)}", file=sys.stderr)
+            print_debug_error(error, f"элемент папки {remote}", debug)
 
 
 def main() -> int:
@@ -324,6 +345,7 @@ def main() -> int:
     parser.add_argument("--file-timeout", type=float, default=30.0)
     parser.add_argument("--preview-timeout", type=float, default=10.0)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--debug", action="store_true", help="Печатать traceback для каждой неудачной попытки")
     args = parser.parse_args()
     try:
         remote = normalize_remote(args.remote_path)
@@ -337,13 +359,14 @@ def main() -> int:
         print_missing_session(state_path)
         return 2
     try:
-        client = DiskWeb(state_path, remote, args.request_timeout)
+        client = DiskWeb(state_path, remote, args.request_timeout, args.debug)
         root = prepare_root(args.local_dir)
         counts = Counter()
         copy_tree(client, remote, root, root, args.retries, args.file_timeout,
-                  args.preview_timeout, counts)
+                  args.preview_timeout, counts, args.debug)
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
         print(f"Не удалось начать копирование: {error_label(error)}", file=sys.stderr)
+        print_debug_error(error, "запуск копирования", args.debug)
         return 1
     print("Итог:", ", ".join(f"{key}={counts[key]}" for key in
                              ("downloaded", "skipped", "previewed",

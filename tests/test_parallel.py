@@ -41,7 +41,7 @@ class Response(BytesIO):
 
 
 class ParallelTests(unittest.TestCase):
-    def test_repeated_excludes_skip_directories_but_not_files(self):
+    def test_repeated_name_excludes_skip_directories_and_files(self):
         remote = "/disk/test"
         excluded = {remote + "/cache-data", remote + "/.git-store",
                     remote + "/keep/cache-nested"}
@@ -91,13 +91,84 @@ class ParallelTests(unittest.TestCase):
                 result = main()
             self.assertEqual(result, 0)
             self.assertEqual(set(visited), {remote, remote + "/keep"})
-            self.assertEqual((output / "cache-file.txt").read_bytes(), b"data")
+            self.assertFalse((output / "cache-file.txt").exists())
             self.assertEqual((output / "keep" / "data.txt").read_bytes(), b"data")
             self.assertFalse((output / "cache-data").exists())
             self.assertFalse((output / ".git-store").exists())
             self.assertFalse((output / "keep" / "cache-nested").exists())
             self.assertIn("excluded_dirs=3", stdout.getvalue())
+            self.assertIn("excluded_files=1", stdout.getvalue())
             self.assertEqual(stderr.getvalue(), "")
+
+    def test_rooted_exclude_matches_path_from_source_root(self):
+        remote = "/disk/Фото/2020"
+        visited = []
+        listings = {
+            remote: [
+                {"name": ".git", "path": remote + "/.git", "type": "dir"},
+                {"name": "10", "path": remote + "/10", "type": "dir"},
+                {"name": "other", "path": remote + "/other", "type": "dir"},
+            ],
+            remote + "/.git": [],
+            remote + "/10": [
+                {"name": ".git", "path": remote + "/10/.git", "type": "dir"},
+                {"name": "05.git", "path": remote + "/10/05.git", "type": "dir"},
+                {"name": ".git-file", "path": remote + "/10/.git-file", "type": "file"},
+                {"name": "data", "path": remote + "/10/data", "type": "file"},
+            ],
+            remote + "/10/05.git": [],
+            remote + "/other": [
+                {"name": ".git", "path": remote + "/other/.git", "type": "dir"},
+            ],
+            remote + "/other/.git": [],
+        }
+
+        class SyntheticDiskWeb:
+            def __init__(self, *args):
+                pass
+
+            def list_children(self, path):
+                visited.append(path)
+                return listings[path]
+
+            def download_url(self, path):
+                return path
+
+            def open_download(self, url):
+                return Response(b"data")
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            state = root / "synthetic-state"
+            state.touch()
+            output = root / "output"
+            argv = ["ydisk_saver.py", "--state", str(state),
+                    "--exclude", "/10/.git", remote, str(output)]
+            stdout, stderr = StringIO(), StringIO()
+            with patch("ydisk_saver.DiskWeb", SyntheticDiskWeb), patch.object(sys, "argv", argv), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                result = main()
+            self.assertEqual(result, 0)
+            self.assertEqual(set(visited), set(listings) - {remote + "/10/.git"})
+            self.assertFalse((output / "10/.git").exists())
+            self.assertFalse((output / "10/.git-file").exists())
+            self.assertTrue((output / ".git").is_dir())
+            self.assertTrue((output / "other/.git").is_dir())
+            self.assertTrue((output / "10/05.git").is_dir())
+            self.assertEqual((output / "10/data").read_bytes(), b"data")
+            self.assertIn("excluded_dirs=1", stdout.getvalue())
+            self.assertIn("excluded_files=1", stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
+
+    def test_relative_exclude_with_slash_is_rejected_before_session_read(self):
+        with TemporaryDirectory() as folder:
+            argv = ["ydisk_saver.py", "--exclude", "10/.git", "/disk/test", folder]
+            stderr = StringIO()
+            with patch.object(sys, "argv", argv), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("должен начинаться с /", stderr.getvalue())
 
     def test_skip_previews_avoids_original_request_in_both_modes(self):
         remote = "/disk/test"

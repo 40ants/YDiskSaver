@@ -424,6 +424,22 @@ class FileQueue:
             self.executor.shutdown(wait=True)
 
 
+def is_excluded(name: str, destination: Path, root: Path,
+                excludes: tuple[str, ...]) -> bool:
+    if not excludes:
+        return False
+    normalized_name = unicodedata.normalize("NFC", name)
+    parent_parts = destination.relative_to(root).parts
+    relative_path = "/" + "/".join(
+        unicodedata.normalize("NFC", part) for part in (*parent_parts, name)
+    )
+    return any(
+        relative_path.startswith(prefix) if prefix.startswith("/")
+        else normalized_name.startswith(prefix)
+        for prefix in excludes
+    )
+
+
 def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
               queue: FileQueue, excludes: tuple[str, ...] = ()) -> None:
     ensure_directory(local, root)
@@ -447,8 +463,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
             try:
                 name = safe_name(item.get("name"))
                 path = item["path"]
-                normalized_name = unicodedata.normalize("NFC", name)
-                if any(normalized_name.startswith(prefix) for prefix in excludes):
+                if is_excluded(name, destination, root, excludes):
                     queue.counts["excluded_dirs"] += 1
                     print_progress(f"Исключена папка: {path}", queue.debug)
                     continue
@@ -467,9 +482,13 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
             if item.get("type") == "dir":
                 continue
             try:
-                safe_name(item.get("name"))
+                name = safe_name(item.get("name"))
                 if item.get("type") != "file":
                     raise ValueError("Неизвестный тип ресурса")
+                if is_excluded(name, destination, root, excludes):
+                    queue.counts["excluded_files"] += 1
+                    print_progress(f"Исключён файл: {item['path']}", queue.debug)
+                    continue
                 queue.submit(item, directory, destination, root)
             except (KeyError, ValueError, OSError, RuntimeError) as error:
                 queue.counts["errors"] += 1
@@ -502,7 +521,7 @@ def main() -> int:
     parser.add_argument("--skip-previews", action="store_true",
                         help="Не скачивать оригинал, если локальное превью уже существует")
     parser.add_argument("--exclude", action="append", metavar="PREFIX", default=[],
-                        help="Не обходить дочерние папки с таким началом имени; можно повторить")
+                        help="Пропустить файлы и папки: префикс имени на любой глубине или /путь от корня; можно повторить")
     parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")
     args = parser.parse_args()
     try:
@@ -514,8 +533,15 @@ def main() -> int:
         parser.error("Таймауты и число попыток должны быть положительными")
     if not 1 <= args.workers <= 8:
         parser.error("Число потоков --workers должно быть от 1 до 8")
-    if any(not prefix or "/" in prefix or "\\" in prefix for prefix in args.exclude):
-        parser.error("--exclude ожидает непустой префикс имени папки без / и \\")
+    for prefix in args.exclude:
+        if not prefix or "\\" in prefix or "\0" in prefix:
+            parser.error("--exclude ожидает непустой префикс без \\ и NUL")
+        if "/" in prefix and not prefix.startswith("/"):
+            parser.error("--exclude с / внутри должен начинаться с /: путь отсчитывается от корня копируемой папки")
+        if prefix.startswith("/") and any(
+            part in ("", ".", "..") for part in prefix[1:].split("/")
+        ):
+            parser.error("--exclude ожидает путь вида /папка/префикс без пустых сегментов, . и ..")
     excludes = tuple(unicodedata.normalize("NFC", prefix) for prefix in args.exclude)
     state_path = args.state.expanduser()
     if not state_path.is_file():
@@ -540,6 +566,7 @@ def main() -> int:
     print_progress("Итог: " + ", ".join(f"{key}={counts[key]}" for key in
                                   ("downloaded", "skipped", "previewed",
                                    "preview_skipped", "directories", "excluded_dirs",
+                                   "excluded_files",
                                    "errors")), args.debug)
     return 1 if counts["errors"] else 0
 

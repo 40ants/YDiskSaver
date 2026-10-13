@@ -7,6 +7,7 @@ import errno
 from email.message import Message
 from io import BytesIO, StringIO
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 from threading import Barrier, Event, Lock, get_ident
 import time
@@ -14,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from ydisk_fs import save_stream
-from ydisk_saver import FileQueue, copy_tree
+from ydisk_saver import FileQueue, copy_tree, main
 
 
 class ListingClient:
@@ -40,6 +41,64 @@ class Response(BytesIO):
 
 
 class ParallelTests(unittest.TestCase):
+    def test_repeated_excludes_skip_directories_but_not_files(self):
+        remote = "/disk/test"
+        excluded = {remote + "/cache-data", remote + "/.git-store",
+                    remote + "/keep/cache-nested"}
+        visited = []
+        listings = {
+            remote: [
+                {"name": "cache-data", "path": remote + "/cache-data", "type": "dir"},
+                {"name": ".git-store", "path": remote + "/.git-store", "type": "dir"},
+                {"name": "keep", "path": remote + "/keep", "type": "dir"},
+                {"name": "cache-file.txt", "path": remote + "/cache-file.txt",
+                 "type": "file", "meta": {"size": 4}},
+            ],
+            remote + "/keep": [
+                {"name": "cache-nested", "path": remote + "/keep/cache-nested",
+                 "type": "dir"},
+                {"name": "data.txt", "path": remote + "/keep/data.txt",
+                 "type": "file", "meta": {"size": 4}},
+            ],
+        }
+
+        class SyntheticDiskWeb:
+            def __init__(self, *args):
+                pass
+
+            def list_children(self, path):
+                if path in excluded:
+                    raise AssertionError("excluded directory was queried")
+                visited.append(path)
+                return listings[path]
+
+            def download_url(self, path):
+                return path
+
+            def open_download(self, url):
+                return Response(b"data")
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            state = root / "synthetic-state"
+            state.touch()
+            output = root / "output"
+            argv = ["ydisk_saver.py", "--state", str(state), "--workers", "2",
+                    "--exclude", "cache", "--exclude", ".git", remote, str(output)]
+            stdout, stderr = StringIO(), StringIO()
+            with patch("ydisk_saver.DiskWeb", SyntheticDiskWeb), patch.object(sys, "argv", argv), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                result = main()
+            self.assertEqual(result, 0)
+            self.assertEqual(set(visited), {remote, remote + "/keep"})
+            self.assertEqual((output / "cache-file.txt").read_bytes(), b"data")
+            self.assertEqual((output / "keep" / "data.txt").read_bytes(), b"data")
+            self.assertFalse((output / "cache-data").exists())
+            self.assertFalse((output / ".git-store").exists())
+            self.assertFalse((output / "keep" / "cache-nested").exists())
+            self.assertIn("excluded_dirs=3", stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
+
     def test_skip_previews_avoids_original_request_in_both_modes(self):
         remote = "/disk/test"
         item = {"name": "photo.jpg", "path": remote + "/photo.jpg", "type": "file"}

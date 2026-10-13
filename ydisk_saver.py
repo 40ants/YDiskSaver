@@ -21,6 +21,7 @@ import sys
 from threading import Lock, local
 import time
 import traceback
+import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
@@ -424,7 +425,7 @@ class FileQueue:
 
 
 def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
-              queue: FileQueue) -> None:
+              queue: FileQueue, excludes: tuple[str, ...] = ()) -> None:
     ensure_directory(local, root)
     pending_directories = [(remote, local)]
     while pending_directories:
@@ -446,6 +447,11 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
             try:
                 name = safe_name(item.get("name"))
                 path = item["path"]
+                normalized_name = unicodedata.normalize("NFC", name)
+                if any(normalized_name.startswith(prefix) for prefix in excludes):
+                    queue.counts["excluded_dirs"] += 1
+                    print_progress(f"Исключена папка: {path}", queue.debug)
+                    continue
                 queue.counts["directories"] += 1
                 target = destination / name
                 ensure_directory(target, root)
@@ -495,6 +501,8 @@ def main() -> int:
                         help="Число одновременных загрузок файлов (от 1 до 8)")
     parser.add_argument("--skip-previews", action="store_true",
                         help="Не скачивать оригинал, если локальное превью уже существует")
+    parser.add_argument("--exclude", action="append", metavar="PREFIX", default=[],
+                        help="Не обходить дочерние папки с таким началом имени; можно повторить")
     parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")
     args = parser.parse_args()
     try:
@@ -506,6 +514,9 @@ def main() -> int:
         parser.error("Таймауты и число попыток должны быть положительными")
     if not 1 <= args.workers <= 8:
         parser.error("Число потоков --workers должно быть от 1 до 8")
+    if any(not prefix or "/" in prefix or "\\" in prefix for prefix in args.exclude):
+        parser.error("--exclude ожидает непустой префикс имени папки без / и \\")
+    excludes = tuple(unicodedata.normalize("NFC", prefix) for prefix in args.exclude)
     state_path = args.state.expanduser()
     if not state_path.is_file():
         print_missing_session(state_path)
@@ -518,7 +529,7 @@ def main() -> int:
                           args.file_timeout, args.preview_timeout, args.workers, counts,
                           args.debug, args.skip_previews)
         try:
-            copy_tree(client, remote, root, root, queue)
+            copy_tree(client, remote, root, root, queue, excludes)
             queue.finish()
         finally:
             queue.close()
@@ -528,7 +539,8 @@ def main() -> int:
         return 1
     print_progress("Итог: " + ", ".join(f"{key}={counts[key]}" for key in
                                   ("downloaded", "skipped", "previewed",
-                                   "preview_skipped", "directories", "errors")), args.debug)
+                                   "preview_skipped", "directories", "excluded_dirs",
+                                   "errors")), args.debug)
     return 1 if counts["errors"] else 0
 
 

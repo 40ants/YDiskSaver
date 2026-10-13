@@ -24,7 +24,7 @@ from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from ydisk_auth import DEFAULT_STATE, ScriptParser, cookie_jar, find_config
-from ydisk_fs import ensure_directory, prepare_root, safe_name, save_stream
+from ydisk_fs import IncompleteFileError, ensure_directory, prepare_root, safe_name, save_stream
 
 
 API = "https://disk.yandex.ru/models-v2"
@@ -304,12 +304,15 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                 try:
                     url = client.download_url(path)
                     with client.open_download(url) as response:
-                        status = save_stream(response, target, root, expected_size, deadline)
+                        status = save_stream(response, target, root, expected_size, deadline,
+                                             save_incomplete=True)
                     counts[status] += 1
                     print_progress(f"{status}: {target}", debug)
                     break
                 except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
                     original_error = error
+                    if isinstance(error, IncompleteFileError) and error.saved_path:
+                        print_progress(f"Неполный файл сохранён: {error.saved_path}", debug)
                     print_debug_error(error, f"оригинал {path}, попытка {attempt + 1}/{retries}", debug)
                     if attempt + 1 < retries:
                         time.sleep(1)

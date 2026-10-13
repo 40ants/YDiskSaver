@@ -6,6 +6,13 @@ from pathlib import Path
 import stat
 import tempfile
 import time
+from typing import Optional
+
+
+class IncompleteFileError(IOError):
+    def __init__(self, actual_size: int, expected_size: int, saved_path: Optional[Path]):
+        super().__init__(f"Получен неполный файл: {actual_size} из {expected_size} байт")
+        self.saved_path = saved_path
 
 
 def safe_name(name: str) -> str:
@@ -41,7 +48,8 @@ def ensure_directory(path: Path, root: Path) -> None:
         raise ValueError(f"Небезопасная папка назначения: {path}")
 
 
-def save_stream(source, destination: Path, root: Path, expected_size=None, deadline=None) -> str:
+def save_stream(source, destination: Path, root: Path, expected_size=None, deadline=None,
+                save_incomplete=False) -> str:
     """Copy a binary stream and publish it only if the target does not exist."""
     destination = Path(os.path.abspath(destination))
     if root not in destination.parents:
@@ -68,8 +76,23 @@ def save_stream(source, destination: Path, root: Path, expected_size=None, deadl
                 size += len(chunk)
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Превышено время скачивания файла")
-            if expected_size is not None and size != expected_size:
-                raise IOError("Получен неполный файл")
+        if expected_size is not None and size != expected_size:
+            saved_path = None
+            if save_incomplete:
+                incomplete = destination.with_name("incomplete-" + destination.name)
+                if not (incomplete.exists() or incomplete.is_symlink()):
+                    try:
+                        os.link(temporary, incomplete)
+                    except FileExistsError:
+                        pass
+                    except OSError as error:
+                        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                            raise
+                        if not (incomplete.exists() or incomplete.is_symlink()):
+                            os.replace(temporary, incomplete)
+                    if incomplete.exists():
+                        saved_path = incomplete
+            raise IncompleteFileError(size, expected_size, saved_path)
         try:
             os.link(temporary, destination)
         except FileExistsError:

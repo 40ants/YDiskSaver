@@ -5,8 +5,34 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from threading import Lock
 import time
 from typing import Optional
+import unicodedata
+
+
+_PUBLICATION_LOCKS = tuple(Lock() for _ in range(64))
+
+
+def _publish(temporary: Path, destination: Path) -> bool:
+    """Publish a complete temporary file once, including on FAT filesystems."""
+    key = unicodedata.normalize("NFC", str(destination)).casefold()
+    with _PUBLICATION_LOCKS[hash(key) % len(_PUBLICATION_LOCKS)]:
+        if destination.exists() or destination.is_symlink():
+            return False
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            return False
+        except OSError as error:
+            if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise
+            # The temporary file is complete and in the destination directory.
+            # The lock protects the existence check and replace from other workers.
+            if destination.exists() or destination.is_symlink():
+                return False
+            os.replace(temporary, destination)
+        return True
 
 
 class IncompleteFileError(IOError):
@@ -80,32 +106,10 @@ def save_stream(source, destination: Path, root: Path, expected_size=None, deadl
             saved_path = None
             if save_incomplete:
                 incomplete = destination.with_name("incomplete-" + destination.name)
-                if not (incomplete.exists() or incomplete.is_symlink()):
-                    try:
-                        os.link(temporary, incomplete)
-                    except FileExistsError:
-                        pass
-                    except OSError as error:
-                        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
-                            raise
-                        if not (incomplete.exists() or incomplete.is_symlink()):
-                            os.replace(temporary, incomplete)
-                    if incomplete.exists():
-                        saved_path = incomplete
+                if _publish(temporary, incomplete):
+                    saved_path = incomplete
             raise IncompleteFileError(size, expected_size, saved_path)
-        try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            return "skipped"
-        except OSError as error:
-            if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
-                raise
-            # FAT filesystems cannot create hard links. The temporary file is
-            # already complete and lives in the destination directory.
-            if destination.exists() or destination.is_symlink():
-                return "skipped"
-            os.replace(temporary, destination)
-        return "downloaded"
+        return "downloaded" if _publish(temporary, destination) else "skipped"
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

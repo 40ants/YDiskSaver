@@ -10,3 +10,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
+
+backup-my-disk.sh
+
+*.log

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -65,6 +66,14 @@ def error_label(error: BaseException) -> str:
     return type(error).__name__
 
 
+def log_message(message: str, *, debug: bool = False, error: bool = False) -> None:
+    """Timestamp every log line; keep debug output on one stream."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stream = sys.stderr if debug or error else sys.stdout
+    print("\n".join(f"[{timestamp}] {line}" for line in message.splitlines()),
+          file=stream, flush=True)
+
+
 def print_debug_error(error: BaseException, context: str, enabled: bool) -> None:
     if not enabled:
         return
@@ -73,7 +82,12 @@ def print_debug_error(error: BaseException, context: str, enabled: bool) -> None
     details = re.sub(r"(?:https?:)?//[^\s'\"<>]+", "<URL скрыт>", details)
     details = re.sub(r"(?im)\b(?:cookie|authorization)\s*[:=]\s*[^\n]+", "<данные входа скрыты>", details)
     details = re.sub(r"(?i)\b(sk|connection_id)\s*[:=]\s*[^\s,;}]+", r"\1=<скрыто>", details)
-    print(f"[debug] {context}\n{details.rstrip()}", file=sys.stderr)
+    log_message(f"[debug] {context}\n{details.rstrip()}", error=True)
+
+
+def print_progress(message: str, debug: bool = False) -> None:
+    """Keep progress visible and ordered alongside tracebacks in debug mode."""
+    log_message(message, debug=debug)
 
 
 def normalize_download_url(url: str) -> str:
@@ -117,16 +131,19 @@ def existing_preview(local: Path, name: str) -> Path | None:
 
 
 def print_missing_session(path: Path) -> None:
-    print(f"Не найден файл сессии Яндекс Диска: {path}", file=sys.stderr)
-    print("Как его создать:", file=sys.stderr)
-    print("  1. Войдите в Яндекс Диск в Chrome и откройте DevTools → Network.", file=sys.stderr)
-    print("  2. Перейдите в папку Диска и выберите «Copy all listed as HAR (with sensitive data)».", file=sys.stderr)
-    print("  3. Сохраните скопированный HAR в файл, затем выполните:", file=sys.stderr)
+    instructions = [
+        f"Не найден файл сессии Яндекс Диска: {path}",
+        "Как его создать:",
+        "  1. Войдите в Яндекс Диск в Chrome и откройте DevTools → Network.",
+        "  2. Перейдите в папку Диска и выберите «Copy all listed as HAR (with sensitive data)».",
+        "  3. Сохраните скопированный HAR в файл, затем выполните:",
+    ]
     if path == DEFAULT_STATE.expanduser():
-        print('     python3 har_to_session.py "$HOME/Downloads/ydisk-session.har"', file=sys.stderr)
+        instructions.append('     python3 har_to_session.py "$HOME/Downloads/ydisk-session.har"')
     else:
-        print('     python3 har_to_session.py "$HOME/Downloads/ydisk-session.har" "' + str(path) + '"', file=sys.stderr)
-    print("Подробности: README.md, раздел «Как получить данные для входа».", file=sys.stderr)
+        instructions.append('     python3 har_to_session.py "$HOME/Downloads/ydisk-session.har" "' + str(path) + '"')
+    instructions.append("Подробности: README.md, раздел «Как получить данные для входа».")
+    log_message("\n".join(instructions), error=True)
 
 
 class DiskWeb:
@@ -254,7 +271,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
         children = list(client.list_children(remote))
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
         counts["errors"] += 1
-        print(f"Ошибка списка {remote}: {error_label(error)}", file=sys.stderr)
+        log_message(f"Ошибка списка {remote}: {error_label(error)}", error=True)
         print_debug_error(error, f"список {remote}", debug)
         return
 
@@ -275,7 +292,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                 raise ValueError("На месте файла уже находится папка")
             if target.exists() or target.is_symlink():
                 counts["skipped"] += 1
-                print(f"Пропуск: {target}")
+                print_progress(f"Пропуск: {target}", debug)
                 continue
             meta = item.get("meta", {})
             expected_size = meta.get("size") if isinstance(meta, dict) else None
@@ -289,7 +306,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                     with client.open_download(url) as response:
                         status = save_stream(response, target, root, expected_size, deadline)
                     counts[status] += 1
-                    print(f"{status}: {target}")
+                    print_progress(f"{status}: {target}", debug)
                     break
                 except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
                     original_error = error
@@ -298,15 +315,15 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                         time.sleep(1)
             else:
                 counts["errors"] += 1
-                print(f"Оригинал недоступен {path}: {error_label(original_error)}", file=sys.stderr)
+                log_message(f"Оригинал недоступен {path}: {error_label(original_error)}", error=True)
                 preview = existing_preview(local, name)
                 if preview:
                     counts["preview_skipped"] += 1
-                    print(f"Превью уже есть: {preview}")
+                    print_progress(f"Превью уже есть: {preview}", debug)
                     continue
                 candidates = list(preview_urls(item))
                 if not candidates and debug:
-                    print(f"[debug] Для {path} в метаданных нет URL превью.", file=sys.stderr)
+                    log_message(f"[debug] Для {path} в метаданных нет URL превью.", error=True)
                 for preview_number, url in enumerate(candidates, 1):
                     try:
                         deadline = time.monotonic() + preview_timeout
@@ -320,16 +337,16 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                             expected = int(length) if length and length.isdigit() else None
                             status = save_stream(response, preview, root, expected, deadline)
                         counts["previewed" if status == "downloaded" else "preview_skipped"] += 1
-                        print(f"Превью: {preview}")
+                        print_progress(f"Превью: {preview}", debug)
                         break
                     except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
                         print_debug_error(error, f"превью {path}, вариант {preview_number}", debug)
                         continue
                 else:
-                    print(f"Превью тоже недоступно: {path}", file=sys.stderr)
+                    log_message(f"Превью тоже недоступно: {path}", error=True)
         except (KeyError, ValueError, OSError) as error:
             counts["errors"] += 1
-            print(f"Ошибка элемента в {remote}: {error_label(error)}", file=sys.stderr)
+            log_message(f"Ошибка элемента в {remote}: {error_label(error)}", error=True)
             print_debug_error(error, f"элемент папки {remote}", debug)
 
 
@@ -345,7 +362,7 @@ def main() -> int:
     parser.add_argument("--file-timeout", type=float, default=30.0)
     parser.add_argument("--preview-timeout", type=float, default=10.0)
     parser.add_argument("--retries", type=int, default=2)
-    parser.add_argument("--debug", action="store_true", help="Печатать traceback для каждой неудачной попытки")
+    parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")
     args = parser.parse_args()
     try:
         remote = normalize_remote(args.remote_path)
@@ -365,12 +382,12 @@ def main() -> int:
         copy_tree(client, remote, root, root, args.retries, args.file_timeout,
                   args.preview_timeout, counts, args.debug)
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
-        print(f"Не удалось начать копирование: {error_label(error)}", file=sys.stderr)
+        log_message(f"Не удалось начать копирование: {error_label(error)}", error=True)
         print_debug_error(error, "запуск копирования", args.debug)
         return 1
-    print("Итог:", ", ".join(f"{key}={counts[key]}" for key in
-                             ("downloaded", "skipped", "previewed",
-                              "preview_skipped", "directories", "errors")))
+    print_progress("Итог: " + ", ".join(f"{key}={counts[key]}" for key in
+                                  ("downloaded", "skipped", "previewed",
+                                   "preview_skipped", "directories", "errors")), args.debug)
     return 1 if counts["errors"] else 0
 
 

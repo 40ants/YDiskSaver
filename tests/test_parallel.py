@@ -40,6 +40,57 @@ class Response(BytesIO):
 
 
 class ParallelTests(unittest.TestCase):
+    def test_skip_previews_avoids_original_request_in_both_modes(self):
+        remote = "/disk/test"
+        item = {"name": "photo.jpg", "path": remote + "/photo.jpg", "type": "file"}
+        listing = ListingClient({remote: [item]})
+        for workers in (1, 2):
+            with self.subTest(workers=workers), TemporaryDirectory() as folder, \
+                    patch("ydisk_saver.DiskWeb", side_effect=AssertionError("HTTP session created")):
+                root = Path(folder).resolve()
+                (root / "preview-photo.jpg").mkdir()
+                (root / "preview-photo.png").write_bytes(b"preview")
+                counts = Counter()
+                queue = FileQueue(listing, Path("unused-state"), remote, 1, 1, 2, 2,
+                                  workers, counts, False, True)
+                try:
+                    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                        copy_tree(listing, remote, root, root, queue)
+                        queue.finish()
+                finally:
+                    queue.close()
+                self.assertEqual(counts["skipped"], 1)
+                self.assertEqual(counts["errors"], 0)
+                self.assertFalse((root / "photo.jpg").exists())
+
+    def test_preview_does_not_skip_original_without_flag(self):
+        remote = "/disk/test"
+        item = {"name": "photo.jpg", "path": remote + "/photo.jpg", "type": "file"}
+
+        class FailingClient(ListingClient):
+            def __init__(self):
+                super().__init__({remote: [item]})
+                self.requests = 0
+
+            def download_url(self, path):
+                self.requests += 1
+                raise TimeoutError("synthetic")
+
+        listing = FailingClient()
+        with TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            (root / "preview-photo.jpg").write_bytes(b"preview")
+            counts = Counter()
+            queue = FileQueue(listing, Path("unused-state"), remote, 1, 1, 2, 2,
+                              1, counts, False)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                copy_tree(listing, remote, root, root, queue)
+                queue.finish()
+            queue.close()
+            self.assertEqual(listing.requests, 1)
+            self.assertEqual(counts["errors"], 1)
+            self.assertEqual(counts["preview_skipped"], 1)
+
     def test_download_starts_before_listing_nested_directory(self):
         remote = "/disk/test"
         started = Event()

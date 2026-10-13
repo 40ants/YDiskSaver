@@ -125,13 +125,31 @@ def preview_urls(item: dict):
                 continue
 
 
-def existing_preview(local: Path, name: str) -> Path | None:
+def existing_preview(local: Path, name: str, *, regular_only: bool = False) -> Path | None:
     stem = Path(name).stem
     for extension in IMAGE_EXTENSIONS.values():
         candidate = local / f"preview-{stem}{extension}"
-        if candidate.exists() or candidate.is_symlink():
+        if regular_only:
+            if not candidate.is_symlink() and candidate.is_file():
+                return candidate
+        elif candidate.exists() or candidate.is_symlink():
             return candidate
     return None
+
+
+def skip_existing(local: Path, name: str, debug: bool, skip_previews: bool) -> bool:
+    target = local / name
+    if target.is_dir() and not target.is_symlink():
+        raise ValueError("На месте файла уже находится папка")
+    if target.exists() or target.is_symlink():
+        print_progress(f"Пропуск: {target}", debug)
+        return True
+    if skip_previews:
+        preview = existing_preview(local, name, regular_only=True)
+        if preview is not None:
+            print_progress(f"Пропуск оригинала (есть превью {preview}): {target}", debug)
+            return True
+    return False
 
 
 def print_missing_session(path: Path) -> None:
@@ -269,18 +287,15 @@ class DiskWeb:
 
 def copy_file(client: DiskWeb, item: dict, remote: str, local: Path, root: Path,
               retries: int, file_timeout: float, preview_timeout: float,
-              debug: bool) -> Counter:
+              debug: bool, skip_previews: bool = False) -> Counter:
     """Copy one file; return counters so workers never mutate shared totals."""
     counts = Counter()
     try:
         name = safe_name(item.get("name"))
         path = item["path"]
         target = local / name
-        if target.is_dir() and not target.is_symlink():
-            raise ValueError("На месте файла уже находится папка")
-        if target.exists() or target.is_symlink():
+        if skip_existing(local, name, debug, skip_previews):
             counts["skipped"] += 1
-            print_progress(f"Пропуск: {target}", debug)
             return counts
         meta = item.get("meta", {})
         expected_size = meta.get("size") if isinstance(meta, dict) else None
@@ -346,7 +361,8 @@ class FileQueue:
 
     def __init__(self, listing_client: DiskWeb, state: Path, remote: str,
                  request_timeout: float, retries: int, file_timeout: float,
-                 preview_timeout: float, workers: int, counts: Counter, debug: bool):
+                 preview_timeout: float, workers: int, counts: Counter, debug: bool,
+                 skip_previews: bool = False):
         self.listing_client = listing_client
         self.state = state
         self.remote = remote
@@ -357,6 +373,7 @@ class FileQueue:
         self.workers = workers
         self.counts = counts
         self.debug = debug
+        self.skip_previews = skip_previews
         self.thread_state = local()
         self.executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ydisk")
                          if workers > 1 else None)
@@ -368,20 +385,18 @@ class FileQueue:
             client = DiskWeb(self.state, self.remote, self.request_timeout, self.debug)
             self.thread_state.client = client
         return copy_file(client, item, directory, local_dir, root, self.retries,
-                         self.file_timeout, self.preview_timeout, self.debug)
+                         self.file_timeout, self.preview_timeout, self.debug,
+                         self.skip_previews)
 
     def submit(self, item: dict, directory: str, local_dir: Path, root: Path) -> None:
-        target = local_dir / item["name"]
-        if target.is_dir() and not target.is_symlink():
-            raise ValueError("На месте файла уже находится папка")
-        if target.exists() or target.is_symlink():
+        if skip_existing(local_dir, item["name"], self.debug, self.skip_previews):
             self.counts["skipped"] += 1
-            print_progress(f"Пропуск: {target}", self.debug)
             return
         if self.executor is None:
             self.counts.update(copy_file(self.listing_client, item, directory, local_dir,
                                          root, self.retries, self.file_timeout,
-                                         self.preview_timeout, self.debug))
+                                         self.preview_timeout, self.debug,
+                                         self.skip_previews))
             return
         future = self.executor.submit(self._worker, item, directory, local_dir, root)
         self.pending[future] = item.get("path", directory)
@@ -472,6 +487,8 @@ def main() -> int:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--workers", type=int, default=1,
                         help="Число одновременных загрузок файлов (1–8, по умолчанию 1)")
+    parser.add_argument("--skip-previews", action="store_true",
+                        help="Не скачивать оригинал, если локальное превью уже существует")
     parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")
     args = parser.parse_args()
     try:
@@ -493,7 +510,7 @@ def main() -> int:
         counts = Counter()
         queue = FileQueue(client, state_path, remote, args.request_timeout, args.retries,
                           args.file_timeout, args.preview_timeout, args.workers, counts,
-                          args.debug)
+                          args.debug, args.skip_previews)
         try:
             copy_tree(client, remote, root, root, queue)
             queue.finish()

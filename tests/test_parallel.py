@@ -8,7 +8,7 @@ from email.message import Message
 from io import BytesIO, StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Barrier, Lock, get_ident
+from threading import Barrier, Event, Lock, get_ident
 import time
 import unittest
 from unittest.mock import patch
@@ -40,6 +40,68 @@ class Response(BytesIO):
 
 
 class ParallelTests(unittest.TestCase):
+    def test_download_starts_before_listing_nested_directory(self):
+        remote = "/disk/test"
+        started = Event()
+
+        class OrderedListing:
+            def list_children(self, directory):
+                if directory == remote:
+                    return [
+                        {"name": "nested", "path": remote + "/nested", "type": "dir"},
+                        {"name": "here.txt", "path": remote + "/here.txt", "type": "file"},
+                    ]
+                if not started.wait(timeout=2):
+                    raise AssertionError("nested listing started before the download")
+                return []
+
+        class WorkerClient:
+            def __init__(self, *args):
+                pass
+
+            def download_url(self, path):
+                started.set()
+                return path
+
+            def open_download(self, url):
+                return Response(b"data")
+
+        listing = OrderedListing()
+        with TemporaryDirectory() as folder, patch("ydisk_saver.DiskWeb", WorkerClient):
+            root = Path(folder).resolve()
+            counts = Counter()
+            queue = FileQueue(listing, Path("unused-state"), remote, 1, 1, 2, 2,
+                              2, counts, False)
+            try:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    copy_tree(listing, remote, root, root, queue)
+                    queue.finish()
+            finally:
+                queue.close()
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertEqual(counts["directories"], 1)
+            self.assertEqual(counts["errors"], 0)
+
+    def test_directory_is_created_before_conflicting_file(self):
+        remote = "/disk/test"
+        items = [
+            {"name": "same", "path": remote + "/same-dir", "type": "dir"},
+            {"name": "same", "path": remote + "/same-file", "type": "file"},
+        ]
+        listing = ListingClient({remote: items})
+        with TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            counts = Counter()
+            queue = FileQueue(listing, Path("unused-state"), remote, 1, 1, 2, 2,
+                              1, counts, False)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                copy_tree(listing, remote, root, root, queue)
+                queue.finish()
+            queue.close()
+            self.assertTrue((root / "same").is_dir())
+            self.assertEqual(counts["directories"], 1)
+            self.assertEqual(counts["errors"], 1)
+
     def test_parallel_downloads_and_existing_file_skip(self):
         remote = "/disk/test"
         items = [

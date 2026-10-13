@@ -411,32 +411,51 @@ class FileQueue:
 def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
               queue: FileQueue) -> None:
     ensure_directory(local, root)
-    try:
-        children = list(client.list_children(remote))
-    except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
-        queue.counts["errors"] += 1
-        log_message(f"Ошибка списка {remote}: {error_label(error)}", error=True)
-        print_debug_error(error, f"список {remote}", queue.debug)
-        return
-
-    # Create and traverse directories before scheduling files in this folder.
-    # A file and a directory with colliding names must not race on FAT.
-    for item in sorted(children, key=lambda entry: entry.get("type") != "dir"):
+    pending_directories = [(remote, local)]
+    while pending_directories:
+        directory, destination = pending_directories.pop()
         try:
-            name = safe_name(item.get("name"))
-            path = item["path"]
-            kind = item.get("type")
-            if kind == "dir":
-                queue.counts["directories"] += 1
-                copy_tree(client, path, local / name, root, queue)
-            elif kind == "file":
-                queue.submit(item, remote, local, root)
-            else:
-                raise ValueError("Неизвестный тип ресурса")
-        except (KeyError, ValueError, OSError, RuntimeError) as error:
+            children = list(client.list_children(directory))
+        except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
             queue.counts["errors"] += 1
-            log_message(f"Ошибка элемента в {remote}: {error_label(error)}", error=True)
-            print_debug_error(error, f"элемент папки {remote}", queue.debug)
+            log_message(f"Ошибка списка {directory}: {error_label(error)}", error=True)
+            print_debug_error(error, f"список {directory}", queue.debug)
+            continue
+
+        # Create direct child directories before queuing files, so colliding
+        # file/directory names cannot race on case-insensitive filesystems.
+        nested = []
+        for item in children:
+            if item.get("type") != "dir":
+                continue
+            try:
+                name = safe_name(item.get("name"))
+                path = item["path"]
+                queue.counts["directories"] += 1
+                target = destination / name
+                ensure_directory(target, root)
+                nested.append((path, target))
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                queue.counts["errors"] += 1
+                log_message(f"Ошибка элемента в {directory}: {error_label(error)}", error=True)
+                print_debug_error(error, f"элемент папки {directory}", queue.debug)
+
+        # Start downloads before querying the next folder. The queue itself
+        # pauses traversal only when its bounded backlog is full.
+        for item in children:
+            if item.get("type") == "dir":
+                continue
+            try:
+                safe_name(item.get("name"))
+                if item.get("type") != "file":
+                    raise ValueError("Неизвестный тип ресурса")
+                queue.submit(item, directory, destination, root)
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                queue.counts["errors"] += 1
+                log_message(f"Ошибка элемента в {directory}: {error_label(error)}", error=True)
+                print_debug_error(error, f"элемент папки {directory}", queue.debug)
+
+        pending_directories.extend(reversed(nested))
 
 
 def main() -> int:

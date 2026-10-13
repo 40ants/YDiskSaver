@@ -477,16 +477,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog="Пример: python3 ydisk_saver.py /disk/crons ~/tmp/disk",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("remote_path", help="Папка на Диске, например /disk/crons")
     parser.add_argument("local_dir", type=Path, help="Локальная папка для её содержимого")
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--request-timeout", type=float, default=8.0)
-    parser.add_argument("--file-timeout", type=float, default=30.0)
-    parser.add_argument("--preview-timeout", type=float, default=10.0)
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE,
+                        help="Файл сессии Яндекс Диска")
+    parser.add_argument("--request-timeout", type=float, default=8.0,
+                        help="Таймаут сетевого запроса в секундах")
+    parser.add_argument("--file-timeout", type=float, default=30.0,
+                        help="Лимит времени скачивания оригинала в секундах")
+    parser.add_argument("--preview-timeout", type=float, default=10.0,
+                        help="Лимит времени скачивания превью в секундах")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Число попыток скачать оригинал")
     parser.add_argument("--workers", type=int, default=1,
-                        help="Число одновременных загрузок файлов (1–8, по умолчанию 1)")
+                        help="Число одновременных загрузок файлов (от 1 до 8)")
     parser.add_argument("--skip-previews", action="store_true",
                         help="Не скачивать оригинал, если локальное превью уже существует")
     parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")

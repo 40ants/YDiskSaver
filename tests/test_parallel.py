@@ -206,7 +206,8 @@ class ParallelTests(unittest.TestCase):
             state.touch()
             output = root / "output"
             argv = ["ydisk_saver.py", "--state", str(state), "--workers", "2",
-                    "--exclude", "cache", "--exclude", ".git", remote, str(output)]
+                    "--exclude", "cache", "--exclude", ".git",
+                    "--remote-path", remote, str(output)]
             stdout, stderr = StringIO(), StringIO()
             with patch("ydisk_saver.DiskWeb", SyntheticDiskWeb), patch.object(sys, "argv", argv), \
                     redirect_stdout(stdout), redirect_stderr(stderr):
@@ -268,7 +269,7 @@ class ParallelTests(unittest.TestCase):
             state.touch()
             output = root / "output"
             argv = ["ydisk_saver.py", "--state", str(state),
-                    "--exclude", "/10/.git", remote, str(output)]
+                    "--exclude", "/10/.git", "--remote-path", remote, str(output)]
             stdout, stderr = StringIO(), StringIO()
             with patch("ydisk_saver.DiskWeb", SyntheticDiskWeb), patch.object(sys, "argv", argv), \
                     redirect_stdout(stdout), redirect_stderr(stderr):
@@ -287,13 +288,36 @@ class ParallelTests(unittest.TestCase):
 
     def test_relative_exclude_with_slash_is_rejected_before_session_read(self):
         with TemporaryDirectory() as folder:
-            argv = ["ydisk_saver.py", "--exclude", "10/.git", "/disk/test", folder]
+            argv = ["ydisk_saver.py", "--exclude", "10/.git", folder]
             stderr = StringIO()
             with patch.object(sys, "argv", argv), redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as raised:
                     main()
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("должен начинаться с /", stderr.getvalue())
+
+    def test_one_local_argument_uses_disk_root_by_default(self):
+        visited = []
+
+        class SyntheticDiskWeb:
+            def __init__(self, _state, remote, _timeout, _debug):
+                self.remote = remote
+
+            def list_children(self, path):
+                visited.append(path)
+                return []
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            state = root / "synthetic-state"
+            state.touch()
+            argv = ["ydisk_saver.py", "--state", str(state), str(root / "output")]
+            with patch("ydisk_saver.DiskWeb", SyntheticDiskWeb), \
+                    patch.object(sys, "argv", argv), \
+                    redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                result = main()
+            self.assertEqual(result, 0)
+            self.assertEqual(visited, ["/disk"])
 
     def test_skip_previews_avoids_original_request_in_both_modes(self):
         remote = "/disk/test"

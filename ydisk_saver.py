@@ -42,6 +42,9 @@ IMAGE_EXTENSIONS = {
     "image/gif": ".gif",
 }
 LOG_LOCK = Lock()
+DEFAULT_REMOTE_PATH = "https://disk.yandex.ru/client/disk/"
+PHOTO_CLUSTER_PAGE = 200
+PHOTO_CLUSTER_BATCH = 10
 
 
 def normalize_remote(value: str) -> str:
@@ -202,14 +205,16 @@ class DiskWeb:
         self.sk = config["sk"]
         self.connection_id = config["idClient"]
 
-    def call(self, method: str, params: dict) -> dict:
+    def call(self, method: str, params: dict | None = None) -> dict:
         for attempt in range(2):
-            body = json.dumps({
+            payload = {
                 "sk": self.sk,
                 "connection_id": self.connection_id,
                 "apiMethod": method,
-                "requestParams": params,
-            }).encode("utf-8")
+            }
+            if params is not None:
+                payload["requestParams"] = params
+            body = json.dumps(payload).encode("utf-8")
             request = Request(
                 f"{API}?m={method}", data=body,
                 headers={**self.headers, "Content-Type": "application/json"},
@@ -273,6 +278,66 @@ class DiskWeb:
             if found == 0:
                 break
             offset += 40
+
+    def photo_snapshot(self) -> str:
+        result = self.call("intapi/photo-init-snapshot")
+        snapshot = result.get("photoslice_id")
+        if not isinstance(snapshot, str) or not snapshot:
+            raise RuntimeError("В ответе photo-init-snapshot нет photoslice_id")
+        return snapshot
+
+    def photo_clusters(self, snapshot: str):
+        offset = 0
+        seen = set()
+        while True:
+            result = self.call("intapi/photo-get-snapshot", {
+                "id": snapshot, "locale": "ru",
+                "amount": PHOTO_CLUSTER_PAGE, "offset": offset,
+            })
+            items = result.get("items")
+            if not isinstance(items, list):
+                raise RuntimeError("Неожиданный список кластеров в photo-get-snapshot")
+            new_clusters = 0
+            for cluster in items:
+                if not isinstance(cluster, dict):
+                    raise RuntimeError("Неожиданный кластер в photo-get-snapshot")
+                cluster_id = cluster.get("id", cluster.get("cluster_id"))
+                size = cluster.get("size")
+                if (not isinstance(cluster_id, str) or not cluster_id
+                        or not isinstance(size, int) or size < 0):
+                    raise RuntimeError("Некорректный ID или размер фото-кластера")
+                if cluster_id not in seen:
+                    seen.add(cluster_id)
+                    new_clusters += 1
+                    yield cluster_id, size
+            offset += len(items)
+            total = result.get("total")
+            if not items or (isinstance(total, int) and offset >= total):
+                break
+            # Some versions of the web API ignore amount/offset and return the
+            # entire snapshot in one response. Do not request it indefinitely.
+            if not isinstance(total, int) and len(items) > PHOTO_CLUSTER_PAGE:
+                break
+            if not new_clusters:
+                raise RuntimeError("photo-get-snapshot повторяет страницу кластеров")
+
+    def photo_resources(self, snapshot: str, clusters: list[tuple[str, int]]) -> list[dict]:
+        requested = {
+            cluster_id: {"range": [0, size - 1]}
+            for cluster_id, size in clusters if size > 0
+        }
+        if not requested:
+            return []
+        result = self.call("intapi/photo-get-clusters-with-resources", {
+            "photosliceId": snapshot,
+            "clusters": requested,
+            "hideScreenshots": False,
+            "filter": "photounlim",
+        })
+        resources = result.get("resources")
+        if not isinstance(resources, dict) or not isinstance(resources.get("fetched"), list):
+            raise RuntimeError("В ответе фото-кластеров нет resources.fetched")
+        return resources["fetched"]
 
     def download_url(self, path: str) -> str:
         result = self.call("mpfs/url", {"path": path})
@@ -592,14 +657,126 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
         pending_directories.extend(reversed(nested))
 
 
+def autoload_item(resource: dict) -> tuple[dict, tuple[str, ...]] | None:
+    """Accept only an image in the photo auto-upload namespace."""
+    if not isinstance(resource, dict):
+        raise ValueError("Неожиданный ресурс фото-кластера")
+    albums = resource.get("albums")
+    if isinstance(albums, list) and "photounlim" not in albums:
+        return None
+    path = None
+    for candidate in (resource.get("path"), resource.get("id")):
+        if isinstance(candidate, str):
+            if candidate.startswith("photounlim:/"):
+                candidate = "/photounlim/" + candidate[len("photounlim:/"):]
+            if candidate.startswith("/photounlim/"):
+                path = candidate
+                break
+    if path is None:
+        return None
+    parts = tuple(safe_name(part) for part in path[len("/photounlim/"):].split("/"))
+    meta = resource.get("meta")
+    if not isinstance(meta, dict):
+        meta = resource
+    mime = meta.get("mimetype") or resource.get("mimetype")
+    media_type = meta.get("mediatype") or resource.get("mediatype")
+    if isinstance(mime, str) and mime and not mime.startswith("image/"):
+        return None
+    if isinstance(media_type, str) and media_type and media_type != "image":
+        return None
+    if not mime and not media_type:
+        return None
+    return {"name": parts[-1], "path": path, "type": "file", "meta": meta}, parts
+
+
+def copy_autoload(client: DiskWeb, local: Path, root: Path, queue: FileQueue,
+                  excludes: tuple[str, ...] = (),
+                  pause: PauseController | None = None) -> None:
+    """List the virtual photo slice without traversing ordinary Disk folders."""
+    ensure_directory(local, root)
+    try:
+        snapshot = client.photo_snapshot()
+    except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
+        queue.counts["errors"] += 1
+        log_message(f"Не удалось открыть фотосрез: {error_label(error)}", error=True)
+        print_debug_error(error, "фотосрез", queue.debug)
+        return
+
+    seen_paths = set()
+
+    def process_batch(batch: list[tuple[str, int]]) -> None:
+        if pause is not None:
+            pause.checkpoint(queue)
+        try:
+            resources = client.photo_resources(snapshot, batch)
+        except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
+            queue.counts["errors"] += 1
+            log_message(f"Ошибка получения ресурсов фото-кластеров: {error_label(error)}",
+                        error=True)
+            print_debug_error(error, "ресурсы фото-кластеров", queue.debug)
+            return
+        queue.counts["autoload_clusters"] += len(batch)
+        for resource in resources:
+            if pause is not None:
+                pause.checkpoint(queue)
+            try:
+                parsed = autoload_item(resource)
+                if parsed is None:
+                    queue.counts["autoload_filtered"] += 1
+                    continue
+                item, parts = parsed
+                if item["path"] in seen_paths:
+                    continue
+                seen_paths.add(item["path"])
+                destination = local.joinpath(*parts[:-1])
+                if is_excluded(parts[-1], destination, local, excludes):
+                    queue.counts["excluded_files"] += 1
+                    continue
+                ensure_directory(destination, root)
+                queue.submit(item, "/photounlim", destination, root)
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                queue.counts["errors"] += 1
+                log_message(f"Ошибка ресурса автозагрузки: {error_label(error)}", error=True)
+                print_debug_error(error, "ресурс автозагрузки", queue.debug)
+
+    batch = []
+    listed_clusters = 0
+    try:
+        for cluster in client.photo_clusters(snapshot):
+            listed_clusters += 1
+            batch.append(cluster)
+            if len(batch) >= PHOTO_CLUSTER_BATCH:
+                process_batch(batch)
+                batch = []
+        if batch:
+            process_batch(batch)
+        if not listed_clusters:
+            queue.counts["errors"] += 1
+            log_message("Фотосрез не вернул ни одного кластера; выгрузка не подтверждена.",
+                        error=True)
+    except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
+        queue.counts["errors"] += 1
+        log_message(f"Ошибка списка фото-кластеров: {error_label(error)}", error=True)
+        print_debug_error(error, "список фото-кластеров", queue.debug)
+        if batch:
+            process_batch(batch)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Пример: python3 ydisk_saver.py /disk/crons ~/tmp/disk",
+        epilog=("Обычно: python3 ydisk_saver.py ~/tmp/disk; "
+                "другая папка: python3 ydisk_saver.py ~/tmp/disk --remote-path /disk/crons; "
+                "автозагрузка: python3 ydisk_saver.py --autoloads ~/tmp/photos"),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
     )
-    parser.add_argument("remote_path", help="Папка на Диске, например /disk/crons")
-    parser.add_argument("local_dir", type=Path, help="Локальная папка для её содержимого")
+    parser.add_argument("local_dir", type=Path,
+                        help="Локальная папка назначения; файлы сохраняются прямо в ней")
+    parser.add_argument("--remote-path", default=DEFAULT_REMOTE_PATH,
+                        help="Начальная папка Диска в обычном режиме")
+    parser.add_argument("--autoloads", action="store_true",
+                        help="Скачать только фото автозагрузки в локальную папку назначения")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE,
                         help="Файл сессии Яндекс Диска")
     parser.add_argument("--request-timeout", type=float, default=8.0,
@@ -618,10 +795,15 @@ def main() -> int:
                         help="Пропустить файлы и папки: префикс имени на любой глубине или /путь от корня; можно повторить")
     parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")
     args = parser.parse_args()
-    try:
-        remote = normalize_remote(args.remote_path)
-    except ValueError as error:
-        parser.error(str(error))
+    if args.autoloads:
+        if args.remote_path != DEFAULT_REMOTE_PATH:
+            parser.error("--remote-path нельзя использовать вместе с --autoloads")
+        remote = "/photo"
+    else:
+        try:
+            remote = normalize_remote(args.remote_path)
+        except ValueError as error:
+            parser.error(str(error))
     if (args.request_timeout <= 0 or args.file_timeout <= 0
             or args.preview_timeout <= 0 or args.retries < 1):
         parser.error("Таймауты и число попыток должны быть положительными")
@@ -654,7 +836,10 @@ def main() -> int:
             pid = os.getpid()
             print_progress(f"PID процесса: {pid}\nПауза/продолжение: kill -HUP {pid}",
                            args.debug)
-            copy_tree(client, remote, root, root, queue, excludes, pause)
+            if args.autoloads:
+                copy_autoload(client, root, root, queue, excludes, pause)
+            else:
+                copy_tree(client, remote, root, root, queue, excludes, pause)
             queue.finish()
             pause.checkpoint(queue)
         finally:
@@ -670,7 +855,7 @@ def main() -> int:
     print_progress("Итог: " + ", ".join(f"{key}={counts[key]}" for key in
                                   ("downloaded", "skipped", "previewed",
                                    "preview_skipped", "unrecovered", "directories", "excluded_dirs",
-                                   "excluded_files",
+                                   "excluded_files", "autoload_clusters", "autoload_filtered",
                                    "errors")), args.debug)
     return 1 if counts["errors"] else 0
 

@@ -75,7 +75,7 @@ def ensure_directory(path: Path, root: Path) -> None:
 
 
 def save_stream(source, destination: Path, root: Path, expected_size=None, deadline=None,
-                save_incomplete=False) -> str:
+                save_incomplete=False, incomplete_name=None) -> str:
     """Copy a binary stream and publish it only if the target does not exist."""
     destination = Path(os.path.abspath(destination))
     if root not in destination.parents:
@@ -105,7 +105,9 @@ def save_stream(source, destination: Path, root: Path, expected_size=None, deadl
         if expected_size is not None and size != expected_size:
             saved_path = None
             if save_incomplete:
-                incomplete = destination.with_name("incomplete-" + destination.name)
+                incomplete = destination.with_name(
+                    incomplete_name or f"incomplete_{os.getpid()}-{destination.name}"
+                )
                 if _publish(temporary, incomplete):
                     saved_path = incomplete
             raise IncompleteFileError(size, expected_size, saved_path)

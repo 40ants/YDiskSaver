@@ -290,7 +290,8 @@ class DiskWeb:
 
 def copy_file(client: DiskWeb, item: dict, remote: str, local: Path, root: Path,
               retries: int, file_timeout: float, preview_timeout: float,
-              debug: bool, skip_previews: bool = False) -> Counter:
+              debug: bool, skip_previews: bool = False,
+              incomplete_name: str | None = None) -> Counter:
     """Copy one file; return counters so workers never mutate shared totals."""
     counts = Counter()
     try:
@@ -311,7 +312,8 @@ def copy_file(client: DiskWeb, item: dict, remote: str, local: Path, root: Path,
                 url = client.download_url(path)
                 with client.open_download(url) as response:
                     status = save_stream(response, target, root, expected_size, deadline,
-                                         save_incomplete=True)
+                                         save_incomplete=True,
+                                         incomplete_name=incomplete_name)
                 counts[status] += 1
                 print_progress(f"{status}: {target}", debug)
                 break
@@ -356,6 +358,9 @@ def copy_file(client: DiskWeb, item: dict, remote: str, local: Path, root: Path,
         counts["errors"] += 1
         log_message(f"Ошибка элемента в {remote}: {error_label(error)}", error=True)
         print_debug_error(error, f"элемент папки {remote}", debug)
+    if not any(counts[key] for key in ("downloaded", "skipped", "previewed",
+                                       "preview_skipped")):
+        counts["unrecovered"] += 1
     return counts
 
 
@@ -382,16 +387,18 @@ class FileQueue:
                          if workers > 1 else None)
         self.pending = {}
 
-    def _worker(self, item: dict, directory: str, local_dir: Path, root: Path) -> Counter:
+    def _worker(self, item: dict, directory: str, local_dir: Path, root: Path,
+                incomplete_name: str | None) -> Counter:
         client = getattr(self.thread_state, "client", None)
         if client is None:
             client = DiskWeb(self.state, self.remote, self.request_timeout, self.debug)
             self.thread_state.client = client
         return copy_file(client, item, directory, local_dir, root, self.retries,
                          self.file_timeout, self.preview_timeout, self.debug,
-                         self.skip_previews)
+                         self.skip_previews, incomplete_name)
 
-    def submit(self, item: dict, directory: str, local_dir: Path, root: Path) -> None:
+    def submit(self, item: dict, directory: str, local_dir: Path, root: Path,
+               incomplete_name: str | None = None) -> None:
         if skip_existing(local_dir, item["name"], self.debug, self.skip_previews):
             self.counts["skipped"] += 1
             return
@@ -399,9 +406,10 @@ class FileQueue:
             self.counts.update(copy_file(self.listing_client, item, directory, local_dir,
                                          root, self.retries, self.file_timeout,
                                          self.preview_timeout, self.debug,
-                                         self.skip_previews))
+                                         self.skip_previews, incomplete_name))
             return
-        future = self.executor.submit(self._worker, item, directory, local_dir, root)
+        future = self.executor.submit(self._worker, item, directory, local_dir, root,
+                                      incomplete_name)
         self.pending[future] = item.get("path", directory)
         if len(self.pending) >= 2 * self.workers:
             self.collect_one()
@@ -414,6 +422,7 @@ class FileQueue:
                 self.counts.update(future.result())
             except Exception as error:
                 self.counts["errors"] += 1
+                self.counts["unrecovered"] += 1
                 log_message(f"Ошибка загрузки {path}: {error_label(error)}", error=True)
                 print_debug_error(error, f"загрузка {path}", self.debug)
 
@@ -485,6 +494,35 @@ def is_excluded(name: str, destination: Path, root: Path,
     )
 
 
+def reserve_incomplete_names(children: list[dict]) -> dict[int, str]:
+    """Keep generated artifacts distinct from listed files, dirs, and each other."""
+    reserved = set()
+    for item in children:
+        try:
+            name = safe_name(item.get("name"))
+        except ValueError:
+            continue
+        reserved.add(unicodedata.normalize("NFC", name).casefold())
+
+    allocated = {}
+    prefix = f"incomplete_{os.getpid()}-"
+    for item in children:
+        if item.get("type") != "file":
+            continue
+        try:
+            name = safe_name(item.get("name"))
+        except ValueError:
+            continue
+        candidate = prefix + name
+        suffix = 1
+        while unicodedata.normalize("NFC", candidate).casefold() in reserved:
+            candidate = f"{prefix}{suffix}-{name}"
+            suffix += 1
+        reserved.add(unicodedata.normalize("NFC", candidate).casefold())
+        allocated[id(item)] = candidate
+    return allocated
+
+
 def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
               queue: FileQueue, excludes: tuple[str, ...] = (),
               pause: PauseController | None = None) -> None:
@@ -501,6 +539,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
             log_message(f"Ошибка списка {directory}: {error_label(error)}", error=True)
             print_debug_error(error, f"список {directory}", queue.debug)
             continue
+        incomplete_names = reserve_incomplete_names(children)
 
         # Create direct child directories before queuing files, so colliding
         # file/directory names cannot race on case-insensitive filesystems.
@@ -541,9 +580,12 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
                     queue.counts["excluded_files"] += 1
                     print_progress(f"Исключён файл: {item['path']}", queue.debug)
                     continue
-                queue.submit(item, directory, destination, root)
+                queue.submit(item, directory, destination, root,
+                             incomplete_names[id(item)])
             except (KeyError, ValueError, OSError, RuntimeError) as error:
                 queue.counts["errors"] += 1
+                if item.get("type") == "file":
+                    queue.counts["unrecovered"] += 1
                 log_message(f"Ошибка элемента в {directory}: {error_label(error)}", error=True)
                 print_debug_error(error, f"элемент папки {directory}", queue.debug)
 
@@ -627,7 +669,7 @@ def main() -> int:
         return 1
     print_progress("Итог: " + ", ".join(f"{key}={counts[key]}" for key in
                                   ("downloaded", "skipped", "previewed",
-                                   "preview_skipped", "directories", "excluded_dirs",
+                                   "preview_skipped", "unrecovered", "directories", "excluded_dirs",
                                    "excluded_files",
                                    "errors")), args.debug)
     return 1 if counts["errors"] else 0

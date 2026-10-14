@@ -15,6 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import ydisk_fs
 from ydisk_fs import save_stream
 from ydisk_saver import FileQueue, PauseController, copy_tree, main
 
@@ -219,6 +220,7 @@ class ParallelTests(unittest.TestCase):
             self.assertFalse((output / "keep" / "cache-nested").exists())
             self.assertIn("excluded_dirs=3", stdout.getvalue())
             self.assertIn("excluded_files=1", stdout.getvalue())
+            self.assertIn("unrecovered=0", stdout.getvalue())
             self.assertIn(f"PID процесса: {os.getpid()}", stdout.getvalue())
             self.assertIn(f"kill -HUP {os.getpid()}", stdout.getvalue())
             self.assertEqual(stderr.getvalue(), "")
@@ -545,9 +547,60 @@ class ParallelTests(unittest.TestCase):
                 queue.close()
             self.assertEqual(counts["errors"], 1)
             self.assertEqual(counts["previewed"], 1)
-            self.assertEqual((root / "incomplete-photo.jpg").read_bytes(), b"abc")
+            self.assertEqual(counts["unrecovered"], 0)
+            self.assertEqual((root / f"incomplete_{os.getpid()}-photo.jpg").read_bytes(), b"abc")
             self.assertEqual((root / "preview-photo.jpg").read_bytes(), b"preview")
             self.assertFalse((root / "photo.jpg").exists())
+
+    def test_incomplete_artifact_cannot_steal_listed_file_name(self):
+        remote = "/disk/test"
+        genuine_name = f"incomplete_{os.getpid()}-X"
+        artifact_name = f"incomplete_{os.getpid()}-1-X"
+        items = [
+            {"name": "X", "path": remote + "/X", "type": "file", "meta": {"size": 8}},
+            {"name": genuine_name, "path": remote + "/" + genuine_name,
+             "type": "file", "meta": {"size": 4}},
+        ]
+        listing = ListingClient({remote: items})
+        artifact_published = Event()
+        original_publish = ydisk_fs._publish
+
+        def publish_and_release(temporary, destination):
+            status = original_publish(temporary, destination)
+            if destination.name == artifact_name:
+                artifact_published.set()
+            return status
+
+        class WorkerClient:
+            def __init__(self, *args):
+                pass
+
+            def download_url(self, path):
+                return path
+
+            def open_download(self, url):
+                if url.endswith("/X"):
+                    return Response(b"BAD")
+                if not artifact_published.wait(timeout=2):
+                    raise AssertionError("incomplete artifact was not published")
+                return Response(b"REAL")
+
+        with TemporaryDirectory() as folder, patch("ydisk_saver.DiskWeb", WorkerClient), \
+                patch("ydisk_fs._publish", publish_and_release):
+            root = Path(folder).resolve()
+            counts = Counter()
+            queue = FileQueue(listing, Path("unused-state"), remote, 1, 1, 2, 2,
+                              2, counts, False)
+            try:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    copy_tree(listing, remote, root, root, queue)
+                    queue.finish()
+            finally:
+                queue.close()
+            self.assertEqual((root / genuine_name).read_bytes(), b"REAL")
+            self.assertEqual((root / artifact_name).read_bytes(), b"BAD")
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertEqual(counts["unrecovered"], 1)
 
     def test_worker_session_failure_is_counted_per_file(self):
         remote = "/disk/test"
@@ -567,6 +620,7 @@ class ParallelTests(unittest.TestCase):
             finally:
                 queue.close()
             self.assertEqual(counts["errors"], 3)
+            self.assertEqual(counts["unrecovered"], 3)
             self.assertEqual(counts["downloaded"], 0)
 
     def test_fat_fallback_never_overwrites_parallel_target(self):

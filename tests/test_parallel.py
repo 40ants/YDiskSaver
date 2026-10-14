@@ -101,6 +101,7 @@ class ParallelTests(unittest.TestCase):
                 self.assertFalse((root / "second").exists())
                 release_download.set()
                 self.assertTrue(paused.wait(timeout=2))
+                self.assertIn(f"Для продолжения: kill -HUP {os.getpid()}", messages[-1])
                 self.assertEqual(counts["downloaded"], 1)
                 self.assertFalse((root / "second").exists())
                 pause.toggle()

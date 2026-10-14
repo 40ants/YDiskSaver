@@ -449,8 +449,9 @@ class PauseController:
         os.sync()
         if not self.requested:
             return
-        log_message(f"Пауза: загрузки завершены. Можно отключить диск. PID={os.getpid()}",
-                    error=True)
+        pid = os.getpid()
+        log_message(f"Пауза: загрузки завершены. Можно отключить диск. PID={pid}\n"
+                    f"Для продолжения: kill -HUP {pid}", error=True)
         while self.requested:
             self.wakeup.wait()
             self.wakeup.clear()

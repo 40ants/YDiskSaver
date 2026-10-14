@@ -6,6 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import errno
 from email.message import Message
 from io import BytesIO, StringIO
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -217,6 +218,8 @@ class ParallelTests(unittest.TestCase):
             self.assertFalse((output / "keep" / "cache-nested").exists())
             self.assertIn("excluded_dirs=3", stdout.getvalue())
             self.assertIn("excluded_files=1", stdout.getvalue())
+            self.assertIn(f"PID процесса: {os.getpid()}", stdout.getvalue())
+            self.assertIn(f"kill -HUP {os.getpid()}", stdout.getvalue())
             self.assertEqual(stderr.getvalue(), "")
 
     def test_rooted_exclude_matches_path_from_source_root(self):

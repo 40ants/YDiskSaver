@@ -608,6 +608,9 @@ def main() -> int:
         pause = PauseController(root)
         previous_sighup = signal.signal(signal.SIGHUP, pause.toggle)
         try:
+            pid = os.getpid()
+            print_progress(f"PID процесса: {pid}\nПауза/продолжение: kill -HUP {pid}",
+                           args.debug)
             copy_tree(client, remote, root, root, queue, excludes, pause)
             queue.finish()
             pause.checkpoint(queue)

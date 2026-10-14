@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import sys
+from threading import Event, Lock, local
 import time
 import traceback
+import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
@@ -36,6 +41,7 @@ IMAGE_EXTENSIONS = {
     "image/avif": ".avif",
     "image/gif": ".gif",
 }
+LOG_LOCK = Lock()
 
 
 def normalize_remote(value: str) -> str:
@@ -68,10 +74,11 @@ def error_label(error: BaseException) -> str:
 
 def log_message(message: str, *, debug: bool = False, error: bool = False) -> None:
     """Timestamp every log line; keep debug output on one stream."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stream = sys.stderr if debug or error else sys.stdout
-    print("\n".join(f"[{timestamp}] {line}" for line in message.splitlines()),
-          file=stream, flush=True)
+    with LOG_LOCK:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print("\n".join(f"[{timestamp}] {line}" for line in message.splitlines()),
+              file=stream, flush=True)
 
 
 def print_debug_error(error: BaseException, context: str, enabled: bool) -> None:
@@ -121,13 +128,31 @@ def preview_urls(item: dict):
                 continue
 
 
-def existing_preview(local: Path, name: str) -> Path | None:
+def existing_preview(local: Path, name: str, *, regular_only: bool = False) -> Path | None:
     stem = Path(name).stem
     for extension in IMAGE_EXTENSIONS.values():
         candidate = local / f"preview-{stem}{extension}"
-        if candidate.exists() or candidate.is_symlink():
+        if regular_only:
+            if not candidate.is_symlink() and candidate.is_file():
+                return candidate
+        elif candidate.exists() or candidate.is_symlink():
             return candidate
     return None
+
+
+def skip_existing(local: Path, name: str, debug: bool, skip_previews: bool) -> bool:
+    target = local / name
+    if target.is_dir() and not target.is_symlink():
+        raise ValueError("На месте файла уже находится папка")
+    if target.exists() or target.is_symlink():
+        print_progress(f"Пропуск: {target}", debug)
+        return True
+    if skip_previews:
+        preview = existing_preview(local, name, regular_only=True)
+        if preview is not None:
+            print_progress(f"Пропуск оригинала (есть превью {preview}): {target}", debug)
+            return True
+    return False
 
 
 def print_missing_session(path: Path) -> None:
@@ -263,108 +288,334 @@ class DiskWeb:
         )
 
 
-def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
+def copy_file(client: DiskWeb, item: dict, remote: str, local: Path, root: Path,
               retries: int, file_timeout: float, preview_timeout: float,
-              counts: Counter, debug: bool = False) -> None:
-    ensure_directory(local, root)
+              debug: bool, skip_previews: bool = False,
+              incomplete_name: str | None = None) -> Counter:
+    """Copy one file; return counters so workers never mutate shared totals."""
+    counts = Counter()
     try:
-        children = list(client.list_children(remote))
-    except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
+        name = safe_name(item.get("name"))
+        path = item["path"]
+        target = local / name
+        if skip_existing(local, name, debug, skip_previews):
+            counts["skipped"] += 1
+            return counts
+        meta = item.get("meta", {})
+        expected_size = meta.get("size") if isinstance(meta, dict) else None
+        if not isinstance(expected_size, int) or expected_size < 0:
+            expected_size = None
+        original_error = None
+        for attempt in range(retries):
+            deadline = time.monotonic() + file_timeout
+            try:
+                url = client.download_url(path)
+                with client.open_download(url) as response:
+                    status = save_stream(response, target, root, expected_size, deadline,
+                                         save_incomplete=True,
+                                         incomplete_name=incomplete_name)
+                counts[status] += 1
+                print_progress(f"{status}: {target}", debug)
+                break
+            except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
+                original_error = error
+                if isinstance(error, IncompleteFileError) and error.saved_path:
+                    print_progress(f"Неполный файл сохранён: {error.saved_path}", debug)
+                print_debug_error(error, f"оригинал {path}, попытка {attempt + 1}/{retries}", debug)
+                if attempt + 1 < retries:
+                    time.sleep(1)
+        else:
+            counts["errors"] += 1
+            log_message(f"Оригинал недоступен {path}: {error_label(original_error)}", error=True)
+            preview = existing_preview(local, name)
+            if preview:
+                counts["preview_skipped"] += 1
+                print_progress(f"Превью уже есть: {preview}", debug)
+                return counts
+            candidates = list(preview_urls(item))
+            if not candidates and debug:
+                log_message(f"[debug] Для {path} в метаданных нет URL превью.", error=True)
+            for preview_number, url in enumerate(candidates, 1):
+                try:
+                    deadline = time.monotonic() + preview_timeout
+                    with client.open_download(url) as response:
+                        mime = response.headers.get_content_type()
+                        extension = IMAGE_EXTENSIONS.get(mime)
+                        if not extension:
+                            raise ValueError("Ответ превью не является поддерживаемым изображением")
+                        preview = local / f"preview-{Path(name).stem}{extension}"
+                        length = response.headers.get("Content-Length")
+                        expected = int(length) if length and length.isdigit() else None
+                        status = save_stream(response, preview, root, expected, deadline)
+                    counts["previewed" if status == "downloaded" else "preview_skipped"] += 1
+                    print_progress(f"Превью: {preview}", debug)
+                    break
+                except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
+                    print_debug_error(error, f"превью {path}, вариант {preview_number}", debug)
+            else:
+                log_message(f"Превью тоже недоступно: {path}", error=True)
+    except (KeyError, ValueError, OSError) as error:
         counts["errors"] += 1
-        log_message(f"Ошибка списка {remote}: {error_label(error)}", error=True)
-        print_debug_error(error, f"список {remote}", debug)
-        return
+        log_message(f"Ошибка элемента в {remote}: {error_label(error)}", error=True)
+        print_debug_error(error, f"элемент папки {remote}", debug)
+    if not any(counts[key] for key in ("downloaded", "skipped", "previewed",
+                                       "preview_skipped")):
+        counts["unrecovered"] += 1
+    return counts
 
+
+class FileQueue:
+    """Bounded download queue with an independent web session per worker."""
+
+    def __init__(self, listing_client: DiskWeb, state: Path, remote: str,
+                 request_timeout: float, retries: int, file_timeout: float,
+                 preview_timeout: float, workers: int, counts: Counter, debug: bool,
+                 skip_previews: bool = False):
+        self.listing_client = listing_client
+        self.state = state
+        self.remote = remote
+        self.request_timeout = request_timeout
+        self.retries = retries
+        self.file_timeout = file_timeout
+        self.preview_timeout = preview_timeout
+        self.workers = workers
+        self.counts = counts
+        self.debug = debug
+        self.skip_previews = skip_previews
+        self.thread_state = local()
+        self.executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ydisk")
+                         if workers > 1 else None)
+        self.pending = {}
+
+    def _worker(self, item: dict, directory: str, local_dir: Path, root: Path,
+                incomplete_name: str | None) -> Counter:
+        client = getattr(self.thread_state, "client", None)
+        if client is None:
+            client = DiskWeb(self.state, self.remote, self.request_timeout, self.debug)
+            self.thread_state.client = client
+        return copy_file(client, item, directory, local_dir, root, self.retries,
+                         self.file_timeout, self.preview_timeout, self.debug,
+                         self.skip_previews, incomplete_name)
+
+    def submit(self, item: dict, directory: str, local_dir: Path, root: Path,
+               incomplete_name: str | None = None) -> None:
+        if skip_existing(local_dir, item["name"], self.debug, self.skip_previews):
+            self.counts["skipped"] += 1
+            return
+        if self.executor is None:
+            self.counts.update(copy_file(self.listing_client, item, directory, local_dir,
+                                         root, self.retries, self.file_timeout,
+                                         self.preview_timeout, self.debug,
+                                         self.skip_previews, incomplete_name))
+            return
+        future = self.executor.submit(self._worker, item, directory, local_dir, root,
+                                      incomplete_name)
+        self.pending[future] = item.get("path", directory)
+        if len(self.pending) >= 2 * self.workers:
+            self.collect_one()
+
+    def collect_one(self) -> None:
+        done, _ = wait(tuple(self.pending), return_when=FIRST_COMPLETED)
+        for future in done:
+            path = self.pending.pop(future)
+            try:
+                self.counts.update(future.result())
+            except Exception as error:
+                self.counts["errors"] += 1
+                self.counts["unrecovered"] += 1
+                log_message(f"Ошибка загрузки {path}: {error_label(error)}", error=True)
+                print_debug_error(error, f"загрузка {path}", self.debug)
+
+    def finish(self) -> None:
+        while self.pending:
+            self.collect_one()
+
+    def close(self) -> None:
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+
+
+class PauseController:
+    """Pause at traversal boundaries after all submitted downloads finish."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.mount = next(path for path in (root, *root.parents) if path.is_mount())
+        self.requested = False
+        self.wakeup = Event()
+
+    def toggle(self, _signum=None, _frame=None) -> None:
+        # A Python signal handler runs on the main thread. Do no I/O here.
+        self.requested = not self.requested
+        self.wakeup.set()
+
+    def checkpoint(self, queue: FileQueue) -> None:
+        if not self.requested:
+            return
+        queue.finish()
+        if not self.requested:
+            return
+        os.sync()
+        if not self.requested:
+            return
+        pid = os.getpid()
+        log_message(f"Пауза: загрузки завершены. Можно отключить диск. PID={pid}\n"
+                    f"Для продолжения: kill -HUP {pid}", error=True)
+        while self.requested:
+            self.wakeup.wait()
+            self.wakeup.clear()
+            if not self.requested and not self.destination_ready():
+                self.requested = True
+                log_message("Диск назначения не подключён к прежнему пути; пауза продолжается. "
+                            "Подключите диск и снова отправьте SIGHUP.", error=True)
+        log_message("Продолжаю копирование.", error=True)
+
+    def destination_ready(self) -> bool:
+        try:
+            return (self.mount.is_mount() and self.root.is_dir()
+                    and self.root.resolve(strict=True) == self.root)
+        except OSError:
+            return False
+
+
+def is_excluded(name: str, destination: Path, root: Path,
+                excludes: tuple[str, ...]) -> bool:
+    if not excludes:
+        return False
+    normalized_name = unicodedata.normalize("NFC", name)
+    parent_parts = destination.relative_to(root).parts
+    relative_path = "/" + "/".join(
+        unicodedata.normalize("NFC", part) for part in (*parent_parts, name)
+    )
+    return any(
+        relative_path.startswith(prefix) if prefix.startswith("/")
+        else normalized_name.startswith(prefix)
+        for prefix in excludes
+    )
+
+
+def reserve_incomplete_names(children: list[dict]) -> dict[int, str]:
+    """Keep generated artifacts distinct from listed files, dirs, and each other."""
+    reserved = set()
     for item in children:
         try:
             name = safe_name(item.get("name"))
-            path = item["path"]
-            kind = item.get("type")
-            target = local / name
-            if kind == "dir":
-                counts["directories"] += 1
-                copy_tree(client, path, target, root, retries, file_timeout,
-                          preview_timeout, counts, debug)
+        except ValueError:
+            continue
+        reserved.add(unicodedata.normalize("NFC", name).casefold())
+
+    allocated = {}
+    prefix = f"incomplete_{os.getpid()}-"
+    for item in children:
+        if item.get("type") != "file":
+            continue
+        try:
+            name = safe_name(item.get("name"))
+        except ValueError:
+            continue
+        candidate = prefix + name
+        suffix = 1
+        while unicodedata.normalize("NFC", candidate).casefold() in reserved:
+            candidate = f"{prefix}{suffix}-{name}"
+            suffix += 1
+        reserved.add(unicodedata.normalize("NFC", candidate).casefold())
+        allocated[id(item)] = candidate
+    return allocated
+
+
+def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
+              queue: FileQueue, excludes: tuple[str, ...] = (),
+              pause: PauseController | None = None) -> None:
+    ensure_directory(local, root)
+    pending_directories = [(remote, local)]
+    while pending_directories:
+        if pause is not None:
+            pause.checkpoint(queue)
+        directory, destination = pending_directories.pop()
+        try:
+            children = list(client.list_children(directory))
+        except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
+            queue.counts["errors"] += 1
+            log_message(f"Ошибка списка {directory}: {error_label(error)}", error=True)
+            print_debug_error(error, f"список {directory}", queue.debug)
+            continue
+        incomplete_names = reserve_incomplete_names(children)
+
+        # Create direct child directories before queuing files, so colliding
+        # file/directory names cannot race on case-insensitive filesystems.
+        nested = []
+        for item in children:
+            if pause is not None:
+                pause.checkpoint(queue)
+            if item.get("type") != "dir":
                 continue
-            if kind != "file":
-                raise ValueError("Неизвестный тип ресурса")
-            if target.is_dir() and not target.is_symlink():
-                raise ValueError("На месте файла уже находится папка")
-            if target.exists() or target.is_symlink():
-                counts["skipped"] += 1
-                print_progress(f"Пропуск: {target}", debug)
-                continue
-            meta = item.get("meta", {})
-            expected_size = meta.get("size") if isinstance(meta, dict) else None
-            if not isinstance(expected_size, int) or expected_size < 0:
-                expected_size = None
-            original_error = None
-            for attempt in range(retries):
-                deadline = time.monotonic() + file_timeout
-                try:
-                    url = client.download_url(path)
-                    with client.open_download(url) as response:
-                        status = save_stream(response, target, root, expected_size, deadline,
-                                             save_incomplete=True)
-                    counts[status] += 1
-                    print_progress(f"{status}: {target}", debug)
-                    break
-                except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
-                    original_error = error
-                    if isinstance(error, IncompleteFileError) and error.saved_path:
-                        print_progress(f"Неполный файл сохранён: {error.saved_path}", debug)
-                    print_debug_error(error, f"оригинал {path}, попытка {attempt + 1}/{retries}", debug)
-                    if attempt + 1 < retries:
-                        time.sleep(1)
-            else:
-                counts["errors"] += 1
-                log_message(f"Оригинал недоступен {path}: {error_label(original_error)}", error=True)
-                preview = existing_preview(local, name)
-                if preview:
-                    counts["preview_skipped"] += 1
-                    print_progress(f"Превью уже есть: {preview}", debug)
+            try:
+                name = safe_name(item.get("name"))
+                path = item["path"]
+                if is_excluded(name, destination, root, excludes):
+                    queue.counts["excluded_dirs"] += 1
+                    print_progress(f"Исключена папка: {path}", queue.debug)
                     continue
-                candidates = list(preview_urls(item))
-                if not candidates and debug:
-                    log_message(f"[debug] Для {path} в метаданных нет URL превью.", error=True)
-                for preview_number, url in enumerate(candidates, 1):
-                    try:
-                        deadline = time.monotonic() + preview_timeout
-                        with client.open_download(url) as response:
-                            mime = response.headers.get_content_type()
-                            extension = IMAGE_EXTENSIONS.get(mime)
-                            if not extension:
-                                raise ValueError("Ответ превью не является поддерживаемым изображением")
-                            preview = local / f"preview-{Path(name).stem}{extension}"
-                            length = response.headers.get("Content-Length")
-                            expected = int(length) if length and length.isdigit() else None
-                            status = save_stream(response, preview, root, expected, deadline)
-                        counts["previewed" if status == "downloaded" else "preview_skipped"] += 1
-                        print_progress(f"Превью: {preview}", debug)
-                        break
-                    except (HTTPError, URLError, OSError, ValueError, RuntimeError, TimeoutError) as error:
-                        print_debug_error(error, f"превью {path}, вариант {preview_number}", debug)
-                        continue
-                else:
-                    log_message(f"Превью тоже недоступно: {path}", error=True)
-        except (KeyError, ValueError, OSError) as error:
-            counts["errors"] += 1
-            log_message(f"Ошибка элемента в {remote}: {error_label(error)}", error=True)
-            print_debug_error(error, f"элемент папки {remote}", debug)
+                queue.counts["directories"] += 1
+                target = destination / name
+                ensure_directory(target, root)
+                nested.append((path, target))
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                queue.counts["errors"] += 1
+                log_message(f"Ошибка элемента в {directory}: {error_label(error)}", error=True)
+                print_debug_error(error, f"элемент папки {directory}", queue.debug)
+
+        # Start downloads before querying the next folder. The queue itself
+        # pauses traversal only when its bounded backlog is full.
+        for item in children:
+            if pause is not None:
+                pause.checkpoint(queue)
+            if item.get("type") == "dir":
+                continue
+            try:
+                name = safe_name(item.get("name"))
+                if item.get("type") != "file":
+                    raise ValueError("Неизвестный тип ресурса")
+                if is_excluded(name, destination, root, excludes):
+                    queue.counts["excluded_files"] += 1
+                    print_progress(f"Исключён файл: {item['path']}", queue.debug)
+                    continue
+                queue.submit(item, directory, destination, root,
+                             incomplete_names[id(item)])
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                queue.counts["errors"] += 1
+                if item.get("type") == "file":
+                    queue.counts["unrecovered"] += 1
+                log_message(f"Ошибка элемента в {directory}: {error_label(error)}", error=True)
+                print_debug_error(error, f"элемент папки {directory}", queue.debug)
+
+        pending_directories.extend(reversed(nested))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog="Пример: python3 ydisk_saver.py /disk/crons ~/tmp/disk",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("remote_path", help="Папка на Диске, например /disk/crons")
     parser.add_argument("local_dir", type=Path, help="Локальная папка для её содержимого")
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--request-timeout", type=float, default=8.0)
-    parser.add_argument("--file-timeout", type=float, default=30.0)
-    parser.add_argument("--preview-timeout", type=float, default=10.0)
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE,
+                        help="Файл сессии Яндекс Диска")
+    parser.add_argument("--request-timeout", type=float, default=8.0,
+                        help="Таймаут сетевого запроса в секундах")
+    parser.add_argument("--file-timeout", type=float, default=30.0,
+                        help="Лимит времени скачивания оригинала в секундах")
+    parser.add_argument("--preview-timeout", type=float, default=10.0,
+                        help="Лимит времени скачивания превью в секундах")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Число попыток скачать оригинал")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Число одновременных загрузок файлов (от 1 до 8)")
+    parser.add_argument("--skip-previews", action="store_true",
+                        help="Не скачивать оригинал, если локальное превью уже существует")
+    parser.add_argument("--exclude", action="append", metavar="PREFIX", default=[],
+                        help="Пропустить файлы и папки: префикс имени на любой глубине или /путь от корня; можно повторить")
     parser.add_argument("--debug", action="store_true", help="Печатать все сообщения и traceback в stderr")
     args = parser.parse_args()
     try:
@@ -374,6 +625,18 @@ def main() -> int:
     if (args.request_timeout <= 0 or args.file_timeout <= 0
             or args.preview_timeout <= 0 or args.retries < 1):
         parser.error("Таймауты и число попыток должны быть положительными")
+    if not 1 <= args.workers <= 8:
+        parser.error("Число потоков --workers должно быть от 1 до 8")
+    for prefix in args.exclude:
+        if not prefix or "\\" in prefix or "\0" in prefix:
+            parser.error("--exclude ожидает непустой префикс без \\ и NUL")
+        if "/" in prefix and not prefix.startswith("/"):
+            parser.error("--exclude с / внутри должен начинаться с /: путь отсчитывается от корня копируемой папки")
+        if prefix.startswith("/") and any(
+            part in ("", ".", "..") for part in prefix[1:].split("/")
+        ):
+            parser.error("--exclude ожидает путь вида /папка/префикс без пустых сегментов, . и ..")
+    excludes = tuple(unicodedata.normalize("NFC", prefix) for prefix in args.exclude)
     state_path = args.state.expanduser()
     if not state_path.is_file():
         print_missing_session(state_path)
@@ -382,15 +645,33 @@ def main() -> int:
         client = DiskWeb(state_path, remote, args.request_timeout, args.debug)
         root = prepare_root(args.local_dir)
         counts = Counter()
-        copy_tree(client, remote, root, root, args.retries, args.file_timeout,
-                  args.preview_timeout, counts, args.debug)
+        queue = FileQueue(client, state_path, remote, args.request_timeout, args.retries,
+                          args.file_timeout, args.preview_timeout, args.workers, counts,
+                          args.debug, args.skip_previews)
+        pause = PauseController(root)
+        previous_sighup = signal.signal(signal.SIGHUP, pause.toggle)
+        try:
+            pid = os.getpid()
+            print_progress(f"PID процесса: {pid}\nПауза/продолжение: kill -HUP {pid}",
+                           args.debug)
+            copy_tree(client, remote, root, root, queue, excludes, pause)
+            queue.finish()
+            pause.checkpoint(queue)
+        finally:
+            try:
+                queue.close()
+                pause.checkpoint(queue)
+            finally:
+                signal.signal(signal.SIGHUP, previous_sighup)
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
         log_message(f"Не удалось начать копирование: {error_label(error)}", error=True)
         print_debug_error(error, "запуск копирования", args.debug)
         return 1
     print_progress("Итог: " + ", ".join(f"{key}={counts[key]}" for key in
                                   ("downloaded", "skipped", "previewed",
-                                   "preview_skipped", "directories", "errors")), args.debug)
+                                   "preview_skipped", "unrecovered", "directories", "excluded_dirs",
+                                   "excluded_files",
+                                   "errors")), args.debug)
     return 1 if counts["errors"] else 0
 
 

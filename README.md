@@ -45,6 +45,7 @@ python3 ydisk_saver.py --help
 
    ![Пункт Copy all listed as HAR (with sensitive data) в меню DevTools](docs/images/copy-har.png)
 
+   Если такого пункта нет, то значит включить "Preferences → Network → Allow to generate HAR with sensitive data" в настройках Devtools.
 4. Локально преобразуйте HAR в файл сессии:
 
    ```bash

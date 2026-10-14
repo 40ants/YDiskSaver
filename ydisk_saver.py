@@ -15,10 +15,12 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import sys
-from threading import Lock, local
+from threading import Event, Lock, local
 import time
 import traceback
 import unicodedata
@@ -424,6 +426,48 @@ class FileQueue:
             self.executor.shutdown(wait=True)
 
 
+class PauseController:
+    """Pause at traversal boundaries after all submitted downloads finish."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.mount = next(path for path in (root, *root.parents) if path.is_mount())
+        self.requested = False
+        self.wakeup = Event()
+
+    def toggle(self, _signum=None, _frame=None) -> None:
+        # A Python signal handler runs on the main thread. Do no I/O here.
+        self.requested = not self.requested
+        self.wakeup.set()
+
+    def checkpoint(self, queue: FileQueue) -> None:
+        if not self.requested:
+            return
+        queue.finish()
+        if not self.requested:
+            return
+        os.sync()
+        if not self.requested:
+            return
+        log_message(f"Пауза: загрузки завершены. Можно отключить диск. PID={os.getpid()}",
+                    error=True)
+        while self.requested:
+            self.wakeup.wait()
+            self.wakeup.clear()
+            if not self.requested and not self.destination_ready():
+                self.requested = True
+                log_message("Диск назначения не подключён к прежнему пути; пауза продолжается. "
+                            "Подключите диск и снова отправьте SIGHUP.", error=True)
+        log_message("Продолжаю копирование.", error=True)
+
+    def destination_ready(self) -> bool:
+        try:
+            return (self.mount.is_mount() and self.root.is_dir()
+                    and self.root.resolve(strict=True) == self.root)
+        except OSError:
+            return False
+
+
 def is_excluded(name: str, destination: Path, root: Path,
                 excludes: tuple[str, ...]) -> bool:
     if not excludes:
@@ -441,10 +485,13 @@ def is_excluded(name: str, destination: Path, root: Path,
 
 
 def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
-              queue: FileQueue, excludes: tuple[str, ...] = ()) -> None:
+              queue: FileQueue, excludes: tuple[str, ...] = (),
+              pause: PauseController | None = None) -> None:
     ensure_directory(local, root)
     pending_directories = [(remote, local)]
     while pending_directories:
+        if pause is not None:
+            pause.checkpoint(queue)
         directory, destination = pending_directories.pop()
         try:
             children = list(client.list_children(directory))
@@ -458,6 +505,8 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
         # file/directory names cannot race on case-insensitive filesystems.
         nested = []
         for item in children:
+            if pause is not None:
+                pause.checkpoint(queue)
             if item.get("type") != "dir":
                 continue
             try:
@@ -479,6 +528,8 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
         # Start downloads before querying the next folder. The queue itself
         # pauses traversal only when its bounded backlog is full.
         for item in children:
+            if pause is not None:
+                pause.checkpoint(queue)
             if item.get("type") == "dir":
                 continue
             try:
@@ -554,11 +605,18 @@ def main() -> int:
         queue = FileQueue(client, state_path, remote, args.request_timeout, args.retries,
                           args.file_timeout, args.preview_timeout, args.workers, counts,
                           args.debug, args.skip_previews)
+        pause = PauseController(root)
+        previous_sighup = signal.signal(signal.SIGHUP, pause.toggle)
         try:
-            copy_tree(client, remote, root, root, queue, excludes)
+            copy_tree(client, remote, root, root, queue, excludes, pause)
             queue.finish()
+            pause.checkpoint(queue)
         finally:
-            queue.close()
+            try:
+                queue.close()
+                pause.checkpoint(queue)
+            finally:
+                signal.signal(signal.SIGHUP, previous_sighup)
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
         log_message(f"Не удалось начать копирование: {error_label(error)}", error=True)
         print_debug_error(error, "запуск копирования", args.debug)

@@ -9,13 +9,13 @@ from io import BytesIO, StringIO
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
-from threading import Barrier, Event, Lock, get_ident
+from threading import Barrier, Event, Lock, Thread, get_ident
 import time
 import unittest
 from unittest.mock import patch
 
 from ydisk_fs import save_stream
-from ydisk_saver import FileQueue, copy_tree, main
+from ydisk_saver import FileQueue, PauseController, copy_tree, main
 
 
 class ListingClient:
@@ -41,6 +41,125 @@ class Response(BytesIO):
 
 
 class ParallelTests(unittest.TestCase):
+    def test_sighup_pause_drains_workers_and_resumes_same_listing(self):
+        remote = "/disk/test"
+        items = [
+            {"name": "first", "path": remote + "/first", "type": "file"},
+            {"name": "second", "path": remote + "/second", "type": "file"},
+        ]
+        listing = ListingClient({remote: items})
+        release_download = Event()
+        first_submitted = Event()
+        paused = Event()
+        messages = []
+
+        class BlockingResponse(Response):
+            def read(self, amount=-1):
+                if not release_download.wait(timeout=3):
+                    raise AssertionError("download was not released")
+                return super().read(amount)
+
+        class WorkerClient:
+            def __init__(self, *args):
+                pass
+
+            def download_url(self, path):
+                return path
+
+            def open_download(self, url):
+                return BlockingResponse(b"data")
+
+        def capture_log(message, **_kwargs):
+            messages.append(message)
+            if message.startswith("Пауза:"):
+                paused.set()
+
+        with TemporaryDirectory() as folder, patch("ydisk_saver.DiskWeb", WorkerClient), \
+                patch("ydisk_saver.os.sync"), patch("ydisk_saver.log_message", capture_log), \
+                redirect_stdout(StringIO()):
+            root = Path(folder).resolve()
+            counts = Counter()
+            queue = FileQueue(listing, Path("unused-state"), remote, 1, 1, 2, 2,
+                              2, counts, False)
+            pause = PauseController(root)
+            original_submit = queue.submit
+
+            def submit_and_pause(*args):
+                original_submit(*args)
+                if not first_submitted.is_set():
+                    first_submitted.set()
+                    pause.toggle()
+
+            queue.submit = submit_and_pause
+            worker = Thread(target=copy_tree,
+                            args=(listing, remote, root, root, queue, (), pause))
+            try:
+                worker.start()
+                self.assertTrue(first_submitted.wait(timeout=2))
+                self.assertFalse(paused.wait(timeout=0.05))
+                self.assertFalse((root / "second").exists())
+                release_download.set()
+                self.assertTrue(paused.wait(timeout=2))
+                self.assertEqual(counts["downloaded"], 1)
+                self.assertFalse((root / "second").exists())
+                pause.toggle()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                queue.finish()
+                self.assertEqual(counts["downloaded"], 2)
+                self.assertTrue((root / "second").is_file())
+                self.assertTrue(any(message.startswith("Продолжаю") for message in messages))
+            finally:
+                release_download.set()
+                if pause.requested:
+                    pause.toggle()
+                worker.join(timeout=2)
+                queue.close()
+
+    def test_resume_waits_for_destination_to_be_mounted(self):
+        pause_announced = Event()
+        mount_rejected = Event()
+        messages = []
+
+        def capture_log(message, **_kwargs):
+            messages.append(message)
+            if message.startswith("Пауза:"):
+                pause_announced.set()
+            if "не подключён" in message:
+                mount_rejected.set()
+
+        with TemporaryDirectory() as folder, patch("ydisk_saver.os.sync"), \
+                patch("ydisk_saver.log_message", capture_log):
+            pause = PauseController(Path(folder).resolve())
+            ready = False
+            pause.destination_ready = lambda: ready
+            paused = Event()
+
+            class EmptyQueue:
+                def finish(self):
+                    paused.set()
+
+            pause.toggle()
+            worker = Thread(target=pause.checkpoint, args=(EmptyQueue(),))
+            try:
+                worker.start()
+                self.assertTrue(paused.wait(timeout=2))
+                self.assertTrue(pause_announced.wait(timeout=2))
+                pause.toggle()
+                self.assertTrue(mount_rejected.wait(timeout=2))
+                self.assertTrue(pause.requested)
+                self.assertTrue(worker.is_alive())
+                ready = True
+                pause.toggle()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(any("не подключён" in message for message in messages))
+            finally:
+                ready = True
+                if pause.requested:
+                    pause.toggle()
+                worker.join(timeout=2)
+
     def test_repeated_name_excludes_skip_directories_and_files(self):
         remote = "/disk/test"
         excluded = {remote + "/cache-data", remote + "/.git-store",

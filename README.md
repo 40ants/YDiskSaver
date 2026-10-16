@@ -85,7 +85,7 @@ python3 ydisk_saver.py --autoloads "$HOME/tmp/АвтозагрузкаФото" 
 
 ```bash
 python3 ydisk_saver.py "$HOME/tmp/disk" --remote-path '/disk/Фото/2020' \
-  --request-timeout 8 --file-timeout 30 --preview-timeout 10 --retries 2
+  --request-timeout 30 --file-timeout 4 --preview-timeout 4 --retries 2
 ```
 
 Для больших файлов увеличьте `--file-timeout`. Повторный запуск пропустит уже существующие локальные файлы. Превью не заменяет оригинал: оно остаётся отдельным файлом с префиксом `preview-`.

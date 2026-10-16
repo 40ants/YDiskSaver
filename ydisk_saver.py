@@ -779,11 +779,11 @@ def main() -> int:
                         help="Скачать только фото автозагрузки в локальную папку назначения")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE,
                         help="Файл сессии Яндекс Диска")
-    parser.add_argument("--request-timeout", type=float, default=8.0,
+    parser.add_argument("--request-timeout", type=float, default=30.0,
                         help="Таймаут сетевого запроса в секундах")
-    parser.add_argument("--file-timeout", type=float, default=30.0,
+    parser.add_argument("--file-timeout", type=float, default=4.0,
                         help="Лимит времени скачивания оригинала в секундах")
-    parser.add_argument("--preview-timeout", type=float, default=10.0,
+    parser.add_argument("--preview-timeout", type=float, default=4.0,
                         help="Лимит времени скачивания превью в секундах")
     parser.add_argument("--retries", type=int, default=2,
                         help="Число попыток скачать оригинал")

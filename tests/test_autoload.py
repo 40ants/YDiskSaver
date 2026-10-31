@@ -39,15 +39,40 @@ class AutoloadTests(unittest.TestCase):
         self.assertEqual(client.photo_snapshot(), "snapshot")
         self.assertNotIn("requestParams", requests[0])
 
-    def test_autoload_excludes_video_from_same_album(self):
-        self.assertIsNone(autoload_item({
+    def test_autoload_accepts_video_from_same_album(self):
+        item, parts = autoload_item({
             "id": "/photounlim/video.mp4", "albums": ["photounlim"],
             "meta": {"size": 100, "mimetype": "video/mp4", "mediatype": "video"},
-        }))
+        })
+        self.assertEqual(item["path"], "/photounlim/video.mp4")
+        self.assertEqual(item["meta"]["size"], 100)
+        self.assertEqual(parts, ("video.mp4",))
         self.assertIsNotNone(autoload_item({
             "id": "/photounlim/photo.heic", "albums": ["photounlim"],
             "meta": {"size": 100, "mimetype": "image/heic", "mediatype": "image"},
         }))
+
+    def test_autoload_video_metadata_variants(self):
+        for meta in ({"mimetype": "video/quicktime"}, {"mediatype": "video"}):
+            for nested in (False, True):
+                with self.subTest(meta=meta, nested=nested):
+                    resource = {"id": "photounlim:/2026/video.mov"}
+                    resource.update({"meta": meta} if nested else meta)
+                    item, parts = autoload_item(resource)
+                    self.assertEqual(item["path"], "/photounlim/2026/video.mov")
+                    self.assertEqual(parts, ("2026", "video.mov"))
+
+    def test_autoload_rejects_non_media_and_unconfirmed_videos(self):
+        for resource in (
+            {"id": "/photounlim/audio.mp3", "mimetype": "audio/mpeg"},
+            {"id": "/photounlim/file.pdf", "mediatype": "document"},
+            {"id": "/photounlim/unknown.mp4"},
+            {"id": "/disk/video.mp4", "mimetype": "video/mp4"},
+            {"id": "/photounlim/video.mp4", "mimetype": "video/mp4",
+             "albums": ["camera"]},
+        ):
+            with self.subTest(resource=resource):
+                self.assertIsNone(autoload_item(resource))
 
     def test_photo_api_uses_snapshot_and_photounlim_filter(self):
         client = DiskWeb.__new__(DiskWeb)
@@ -123,7 +148,7 @@ class AutoloadTests(unittest.TestCase):
                 return "snapshot"
 
             def photo_clusters(self, snapshot):
-                return iter([("cluster", 3)])
+                return iter([("cluster", 4)])
 
             def photo_resources(self, snapshot, clusters):
                 return [
@@ -134,14 +159,16 @@ class AutoloadTests(unittest.TestCase):
                     {"id": "/disk/ordinary.jpg", "size": 4},
                     {"id": "/photounlim/2026/not-autoload.jpg", "size": 4,
                      "albums": ["camera"]},
+                    {"id": "photounlim:/2026/video.mp4", "albums": ["photounlim"],
+                     "meta": {"size": 5, "mimetype": "video/mp4", "mediatype": "video"}},
                 ]
 
             def download_url(self, path):
-                assert path == "/photounlim/2026/photo.heic"
+                assert path in ("/photounlim/2026/photo.heic", "/photounlim/2026/video.mp4")
                 return path
 
             def open_download(self, url):
-                return BytesIO(b"data")
+                return BytesIO(b"video" if url.endswith(".mp4") else b"data")
 
         for workers in (1, 2):
             with self.subTest(workers=workers), TemporaryDirectory() as folder:
@@ -158,11 +185,13 @@ class AutoloadTests(unittest.TestCase):
                     result = main()
                 self.assertEqual(result, 0)
                 self.assertEqual((output / "2026/photo.heic").read_bytes(), b"data")
+                self.assertEqual((output / "2026/video.mp4").read_bytes(), b"video")
                 self.assertFalse((output / "ordinary.jpg").exists())
                 self.assertFalse((output / "2026/not-autoload.jpg").exists())
                 self.assertFalse((output / "АвтозагрузкаФото").exists())
                 self.assertIn("autoload_clusters=1", stdout.getvalue())
                 self.assertIn("autoload_filtered=2", stdout.getvalue())
+                self.assertIn("downloaded=2", stdout.getvalue())
 
     def test_autoload_requires_one_local_path(self):
         argv = ["ydisk_saver.py", "--autoloads", "/disk/Фото", "/tmp/output"]

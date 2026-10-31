@@ -658,7 +658,7 @@ def copy_tree(client: DiskWeb, remote: str, local: Path, root: Path,
 
 
 def autoload_item(resource: dict) -> tuple[dict, tuple[str, ...]] | None:
-    """Accept only an image in the photo auto-upload namespace."""
+    """Accept images and videos in the photo auto-upload namespace."""
     if not isinstance(resource, dict):
         raise ValueError("Неожиданный ресурс фото-кластера")
     albums = resource.get("albums")
@@ -680,9 +680,9 @@ def autoload_item(resource: dict) -> tuple[dict, tuple[str, ...]] | None:
         meta = resource
     mime = meta.get("mimetype") or resource.get("mimetype")
     media_type = meta.get("mediatype") or resource.get("mediatype")
-    if isinstance(mime, str) and mime and not mime.startswith("image/"):
+    if isinstance(mime, str) and mime and not mime.startswith(("image/", "video/")):
         return None
-    if isinstance(media_type, str) and media_type and media_type != "image":
+    if isinstance(media_type, str) and media_type and media_type not in ("image", "video"):
         return None
     if not mime and not media_type:
         return None
@@ -776,7 +776,7 @@ def main() -> int:
     parser.add_argument("--remote-path", default=DEFAULT_REMOTE_PATH,
                         help="Начальная папка Диска в обычном режиме")
     parser.add_argument("--autoloads", action="store_true",
-                        help="Скачать только фото автозагрузки в локальную папку назначения")
+                        help="Скачать фото и видео автозагрузки в локальную папку назначения")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE,
                         help="Файл сессии Яндекс Диска")
     parser.add_argument("--request-timeout", type=float, default=30.0,
